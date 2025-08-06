@@ -48,7 +48,7 @@ ${car?.name || 'У вас нет машины'}</b>`
     sendSos: async (form_id, type, ctx) => {
 
         const user = await db.getUser(ctx.from.id);
-        const all = await db.getManagersAndLogists(user.zavod);
+        const all = await db.getManagersAndLogistsByZavodAndForm(user.zavod, parseInt(form_id));
         let i = 0;
         const interval = setInterval(async ()=>{
             if(i === all.length){

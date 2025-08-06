@@ -1,7 +1,7 @@
 const { Scenes, Markup} = require('telegraf');
 const db = require('./database');
 const { query, getUser, createForm} = require('./database');
-const {mainMenu, betonType, status, payForms, editTypes, ancetaStatus} = require('./data');
+const {mainMenu, betonType, status, payForms, editTypes, ancetaStatus, entity} = require('./data');
 const Calendar = require('telegraf-calendar-telegram');
 const XLSX = require('xlsx');
 const fs = require('fs');
@@ -38,10 +38,52 @@ const index = require(`./index`);
 
 const carrierModels = require('./carrier/models');
 
+function toFloat(str) {
+    if (typeof str !== 'string') {
+      return parseFloat(str) || 0;
+    }
+  
+    // Удаляем ВСЕ пробелы и лишние символы, оставляем только цифры, одну точку/запятую и минус
+    const cleaned = str
+      .replace(/\s+/g, '')          // Удаляем пробелы
+      .replace(/[^\d.,-]/g, '')     // Удаляем всё, кроме цифр, точек, запятых и минуса
+      .replace(/,/g, '.');          // Меняем запятые на точки
+  
+    // Удаляем лишние точки/запятые (оставляем только первую)
+    const parts = cleaned.split('.');
+    const integerPart = parts[0] || '0';
+    const decimalPart = parts.length > 1 ? `.${parts[1]}` : '';
+  
+    const result = parseFloat(integerPart + decimalPart);
+    return isNaN(result) ? 0 : result;
+  }
+  
+
 module.exports.setupScenes = () => {
     function hasDangerousChars(text) {
         return /[{}[\]\\|`]/.test(text);
     }
+
+    const createErrorHandledScene = (sceneId, ...steps) => {
+        const scene = new Scenes.WizardScene(sceneId, ...steps);
+        
+        // Обработчик ошибок для всей сцены
+        scene.use(async (ctx, next) => {
+          try {
+            // Важно: await next() передает управление следующему middleware или шагу сцены
+            await next();
+          } catch (error) {
+            console.error(`Ошибка в сцене ${sceneId}:`, error);
+            await ctx.scene.leave();
+            
+            // Можно также отправить сообщение об ошибке (опционально)
+            await ctx.replyWithHTML(`${error.message}`);
+          }
+        });
+        
+        return scene;
+      };
+
     const enter_name= new Scenes.WizardScene(
         'enter_name',
         async (ctx) => {
@@ -417,7 +459,12 @@ module.exports.setupScenes = () => {
                 else if(ctx.callbackQuery.data.startsWith(`type_`)){
                     await ctx.deleteMessage(ctx.wizard.state.messageId)
                     ctx.wizard.state.betonType = ctx.callbackQuery.data.split('_')[1];
-                    const s = await ctx.replyWithHTML(`⚖️ <b>Укажите объем бетона который вам нужен (в кубических метрах)</b>`, {reply_markup: {inline_keyboard: [[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
+                    const s = await ctx.replyWithHTML(`⚖️ <b>Укажите объем/цену за кубометр со скидкой 
+❗️Если цена по прайсу, напишите только объем❗️
+❗️Если нецелое число, то вводите через точку или запятую❗️
+Выбранная вами марка: ${await db.getBetonName(ctx.wizard.state.betonType)}
+
+(Пример 10/7000)</b>`, {reply_markup: {inline_keyboard: [[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
                     ctx.wizard.state.messageId = s.message_id;
                     return ctx.wizard.next();
                 }
@@ -583,7 +630,7 @@ module.exports.setupScenes = () => {
                 }
                 else if(ctx.callbackQuery.data === `sendz`){
                     const all = await query(`SELECT * FROM zavod WHERE type=0`);
-                    let but = all.map(s=>[{text: `• ${s.name}`, callback_data: 'ignore'}, {text: 'О заводе', callback_data: `getz:${s.fid}`}]);
+                    let but = all.map(s=>[{text: `• ${s.name}`, callback_data: 'ignore'}, {text: 'Выбрать', callback_data: `getz:${s.fid}`}]);
                     but.push([{text: 'Вернуться', callback_data: 'toancet'}]);
                     ctx.editMessageText(`📨 <b>Отправить запрос на конкретный завод</b>`, {parse_mode: 'HTML', reply_markup: {inline_keyboard: but}})
                 }
@@ -769,6 +816,8 @@ module.exports.setupScenes = () => {
             if(phone){
                 ctx.deleteMessage()
                 ctx.deleteMessage(ctx.wizard.state.messageId2);
+                await db.updateUser(ctx.from.id, 'status', ctx.wizard.state.status)
+                await db.updateUser(ctx.from.id, 'zavod', ctx.wizard.state.creater_zavod)
                 await query(`UPDATE users SET phone=? WHERE id=?`, [phone, ctx.from.id])
                 let user = await getUser(ctx.from.id);
                 mainMenu(ctx, user.status)
@@ -828,6 +877,7 @@ module.exports.setupScenes = () => {
                 ctx.wizard.state.name = name;
 
                 await db.updateUser(ctx.from.id, `real_name`, name);
+                await db.updateUser(ctx.from.id, 'status', 7)
                 const zavod = await db.createZavod(ctx.from.id, ctx.wizard.state.company_name, 1);
 
                 if(!zavod) return;
@@ -863,7 +913,7 @@ module.exports.setupScenes = () => {
             if(!hasDangerousChars(form)){
                 const user = await getUser(ctx.from.id);
                 if(user && user.status === 5){
-                    await query(`INSERT INTO cars (name, zavod) VALUES (?,?)`, [form, user.zavod])
+                    await query(`INSERT INTO cars (name, zavod) VALUES (?,?)`, [form ? form.normalize("NFKD").replace(/[^\w\s]/g, "") : 'Машина', user.zavod])
                     ctx.deleteMessage(ctx.wizard.state.messageId2);
                     ctx.deleteMessage()
                     ctx.res = user
@@ -881,6 +931,83 @@ module.exports.setupScenes = () => {
             }
         }
     );
+
+    
+    const create_zavod = new Scenes.WizardScene(
+        'create_zavod',
+        async (ctx) => {
+            const s = await ctx.replyWithHTML(`<b>Введите название завода</b>`, {reply_markup: {inline_keyboard: [[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
+            ctx.wizard.state.messageId2 = s.message_id;
+            return ctx.wizard.next();
+        },
+        async (ctx) => {
+            let name = ctx.message.text;
+            if(!hasDangerousChars(name)){
+                ctx.wizard.state.zavod_name = name;
+                ctx.deleteMessage(ctx.wizard.state.messageId2);
+                ctx.deleteMessage()
+                const s = await ctx.replyWithHTML(`<b>Введите описание завода</b>`);
+                ctx.wizard.state.messageId2 = s.message_id;
+                return ctx.wizard.next();
+            }
+            else {
+                await ctx.reply(`❌`)
+                return ctx.scene.leave()
+            }
+        },
+        async (ctx) => {
+            let name = ctx.message.text;
+            if(!hasDangerousChars(name)){
+                ctx.wizard.state.zavod_discription = name;
+                ctx.deleteMessage(ctx.wizard.state.messageId2);
+                ctx.deleteMessage()
+                const s = await ctx.replyWithHTML(`<b>Введите адрес завода</b>`);
+                ctx.wizard.state.messageId2 = s.message_id;
+                return ctx.wizard.next();
+            }
+            else {
+                await ctx.reply(`❌`)
+                return ctx.scene.leave()
+            }
+        },
+        async (ctx) => {
+            if(ctx.callbackQuery){
+                if(ctx.callbackQuery.data === `stopscene`){
+                    ctx.deleteMessage();
+                    return await ctx.scene.leave();
+                }
+            }
+            let place = ctx.message.text;
+            if(!hasDangerousChars(place)){
+                const user = await getUser(ctx.from.id);
+                if(user && user.status === 8){
+                    ctx.scene.leave()
+                    const {state} = ctx.wizard
+                    const zavodId = await db.createZavod(ctx.from.id, state.zavod_name, 0, place, state.zavod_discription);
+
+                    let hash = index.generateRandomString(18)
+            
+                    let res = await query(`INSERT INTO links (zavod, hash, do, \`from\`) VALUES (?,?,?,?)`, [zavodId,hash, `add:5`,ctx.from.id])
+            
+                    const s = await ctx.replyWithHTML(`<b>Создана новая реферальная ссылка для ${status[5]}</b>
+            
+<b>Ссылка:</b> <a href="t.me/${(await ctx.telegram.getMe()).username}?start=${hash}">*СКОПИРУЙТЕ*</a>
+            
+<i>ССЫЛКА ОДНОРАЗОВАЯ</i>`, {reply_markup: {inline_keyboard: [[{text: 'Удалить ссылку', callback_data: `deletelink:${res.insertId}`}]]}})
+                    ctx.pinChatMessage(s.message_id);
+                }
+                else{
+                    await ctx.reply(`❌`)
+                    return ctx.scene.leave()
+                }
+            }
+            else {
+                await ctx.reply(`❌`)
+                return ctx.scene.leave()
+            }
+        }
+    );
+
 
     const add_car_carrier = new Scenes.WizardScene(
         'add_car_carrier',
@@ -964,7 +1091,6 @@ module.exports.setupScenes = () => {
                     });
                     return;
                 }
-
                 if (ctx.callbackQuery.data.startsWith('calendar-telegram-next')) {
                     const { currentMonth, currentYear } = ctx.wizard.state;
                     const nextMonth = currentMonth === 11 ? 0 : currentMonth + 1;
@@ -984,7 +1110,6 @@ module.exports.setupScenes = () => {
                     });
                     return;
                 }
-
                 else if (ctx.callbackQuery.data.startsWith('calendar-telegram-ignore')) {
                     return ctx.answerCbQuery();
                 }
@@ -1238,6 +1363,8 @@ module.exports.setupScenes = () => {
                     ctx.wizard.state.betonType = parseInt(ctx.callbackQuery.data.split('_')[1]);
                     const s = await ctx.replyWithHTML(`⚖️ <b>Укажите объем/цену за кубометр со скидкой 
 ❗️Если цена по прайсу, напишите только объем❗️
+❗️Если нецелое число, то вводите через точку или запятую❗️
+Выбранная вами марка: ${await db.getBetonName(ctx.wizard.state.betonType)}
 
 (Пример 10/7000)</b>`, {reply_markup: {inline_keyboard: [[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
                     ctx.wizard.state.messageId = s.message_id;
@@ -1256,15 +1383,14 @@ module.exports.setupScenes = () => {
             await ctx.deleteMessage();
             const input = ctx.message.text.split('/');
             const price = await query(`SELECT * FROM nc WHERE fid=?`, [ctx.wizard.state.betonType]);
-            if(input.length === 2 && !isNaN(input[0]) && !isNaN(input[1])){
-                ctx.wizard.state.amount = input[0];
-                ctx.wizard.state.userPrice = input[1];
+            if(input.length === 2 && input[0] && input[1]){
+                ctx.wizard.state.amount = toFloat(input[0]);
+                ctx.wizard.state.userPrice = toFloat(input[1]);
                 ctx.wizard.state.price = price[0].price_per_unit;
             }
             else{
-                
                 if(price.length > 0){
-                    ctx.wizard.state.amount = ctx.message.text;
+                    ctx.wizard.state.amount = toFloat(ctx.message.text);
                     ctx.wizard.state.price = price[0].price_per_unit;
                     ctx.wizard.state.userPrice = price[0].price_per_unit;
                 }
@@ -1276,9 +1402,9 @@ module.exports.setupScenes = () => {
             }
             const s = await ctx.replyWithHTML(`<b>Обьем: ${ctx.wizard.state.amount} м³
 Цена: ${ctx.wizard.state.userPrice} руб/м³
-Итоговая цена: ${ctx.wizard.state.amount * ctx.wizard.state.userPrice} руб
+Итоговая цена: ${Math.round(ctx.wizard.state.amount * ctx.wizard.state.userPrice)} руб
                 
-💸 Выберите форму оплаты</b>`, {reply_markup: {inline_keyboard: [[{text: 'По факту на месте', callback_data: 'pay_form:0'}],[{text: 'Предоплата', callback_data: 'pay_form:1'}],[{text: 'Предоплата %', callback_data: 'pay_form:2'}],[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
+💸 Выберите форму оплаты</b>`, {reply_markup: {inline_keyboard: [[{text: 'По факту на месте', callback_data: 'pay_form:0'}],[{text: 'Предоплата', callback_data: 'pay_form:1'}],[{text: 'Предоплата % или руб.', callback_data: 'pay_form:2'}],[{text: 'Постоплата', callback_data: 'pay_form:3'}],[{text: 'Не указывать', callback_data: 'pay_form:4'}],[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
             ctx.wizard.state.messageId = s.message_id;
             return ctx.wizard.next();
         },
@@ -1294,17 +1420,19 @@ module.exports.setupScenes = () => {
                     if(form !== 2){
                         ctx.wizard.state.payForm = form;
                         const s = await ctx.replyWithHTML(`<b>📦 Укажите: доставка по прайсу куб/Доставка за куб/количество кубов на доставку, или же: доставка по прайсу куб/количество кубов на доставку
+
+Ваш объем: ${ctx.wizard.state.amount} м³
                             
 Пример 
 900/10 (продажа без скидки)
-800/900/10 (продажа со скидкой)</b>`, {reply_markup: {inline_keyboard: [[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
+900/800/10 (продажа со скидкой)</b>`, {reply_markup: {inline_keyboard: [[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
                         ctx.wizard.state.messageId = s.message_id;
                         return ctx.wizard.next();
                     }
                     else{
                         ctx.wizard.state.payForm = form;
                         ctx.wizard.state.enterProc = true;
-                        const s = await ctx.replyWithHTML(`📎 <b>Введите процент предоплаты</b>`, {reply_markup: {inline_keyboard: [[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
+                        const s = await ctx.replyWithHTML(`📎 <b>Введите процент или сумму предоплаты</b>`, {reply_markup: {inline_keyboard: [[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
                         ctx.wizard.state.messageId = s.message_id;
                     }
                 }
@@ -1314,7 +1442,13 @@ module.exports.setupScenes = () => {
                 await ctx.deleteMessage(ctx.wizard.state.messageId)
                 delete ctx.wizard.state.enterProc;
                 ctx.wizard.state.payFormProcent = parseInt(ctx.message.text);
-                const s = await ctx.replyWithHTML(`<b>📦 Укажите: доставка по прайсу куб/Доставка за куб/количество кубов на доставку, или же: доставка по прайсу куб/количество кубов на доставку</b>`, {reply_markup: {inline_keyboard: [[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
+                const s = await ctx.replyWithHTML(`<b>📦 Укажите: доставка по прайсу куб/Доставка за куб/количество кубов на доставку, или же: доставка по прайсу куб/количество кубов на доставку
+
+Ваш объем: ${ctx.wizard.state.amount} м³
+                            
+Пример 
+900/10 (продажа без скидки)
+900/800/10 (продажа со скидкой)</b>`, {reply_markup: {inline_keyboard: [[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
                 ctx.wizard.state.messageId = s.message_id;
                 return ctx.wizard.next();
             }
@@ -1331,15 +1465,15 @@ module.exports.setupScenes = () => {
             const input = ctx.message.text.split('/');
             if(input.length === 3){
                 ctx.wizard.state.delivery = {
-                    price: input[0],
-                    price_with_add: input[1],
-                    amount: input[2]
+                    price: toFloat(input[0]),
+                    price_with_add: toFloat(input[1]),
+                    amount: toFloat(input[2])
                 }
             }
             else if(input.length === 2){
                 ctx.wizard.state.delivery = {
-                    price: input[0],
-                    amount: input[1],
+                    price: toFloat(input[0]),
+                    amount: toFloat(input[1]),
                     price_with_add: null
                 }
             }
@@ -1390,25 +1524,49 @@ module.exports.setupScenes = () => {
                         if(!ctx.wizard.state.dop){
                             ctx.wizard.state.dop = [];
                         }
-                        ctx.wizard.state.dop.push(dop);
-                        await ctx.answerCbQuery(`✅ Доп. услуга ${dop.name} добавлена`);
-                        const all_dops = await query(`SELECT * FROM nc WHERE zavod=? AND \`key\`=? AND rod_id=-1`, [(await getUser(ctx.from.id)).zavod, 'Equimpent']);
-                        let but = all_dops.map(s => [{text: `${s.name}`, callback_data: `dop:${s.fid}`}]);
-                        but.push([{text: 'Далее', callback_data: 'next'}]);
-                        but.push([{text: '❌ Отмена', callback_data: 'stopscene'}]);
-                        await ctx.editMessageReplyMarkup({
-                            inline_keyboard: but
-                        });
+                        if(dop.multiplicity > 1){
+                            ctx.wizard.state.pendingDop = dop;
+                            await ctx.replyWithHTML(
+                                `Введите количество для <b>${dop.name}</b> (максимум: ${dop.multiplicity}):`,
+                                {reply_markup: {inline_keyboard: [[{text: 'Отмена', callback_data: 'back_dop'}]]}}
+                            );
+                        }
+                        else{
+                            ctx.deleteMessage();
+                            const count = 1;
+                            ctx.wizard.state.dop.push({...dop, count});
+                            // Формируем текст с выбранными доп. услугами
+                            let selectedText = '';
+                            if(ctx.wizard.state.dop && ctx.wizard.state.dop.length > 0){
+                                selectedText = '<b>Вы выбрали:</b>\n' + ctx.wizard.state.dop.map(d => `• ${d.name} — <b>${d.count}x</b> ${d.unit_of_measurement || ''} ${d.price_per_unit * d.count} (${d.price_per_unit} за ед.)`).join('\n') + '\n\n';
+                            }
+                            // вернуть клавиатуру допов
+                            const all_dops = await query(`SELECT * FROM nc WHERE zavod=? AND \`key\`=? AND rod_id=-1`, [(await getUser(ctx.from.id)).zavod, 'Equimpent']);
+                            let but = all_dops.map(s => [{text: `${s.name}`, callback_data: `dop:${s.fid}`}]);
+                            but.push([{text: 'Далее', callback_data: 'next'}]);
+                            but.push([{text: '❌ Отмена', callback_data: 'stopscene'}]);
+                            await ctx.replyWithHTML(
+                                `${selectedText}<b>Выберите доп. услуги к заявке:</b>`,
+                                {reply_markup: {inline_keyboard: but}}
+                            );
+                            return;
+                        }
                     }
                 }
                 else if(ctx.callbackQuery.data === 'back_dop'){
+                    // Формируем текст с выбранными доп. услугами
+                    let selectedText = '';
+                    if(ctx.wizard.state.dop && ctx.wizard.state.dop.length > 0){
+                        selectedText = '<b>Вы выбрали:</b>\n' + ctx.wizard.state.dop.map(d => `• ${d.name} — <b>${d.count}x</b> ${d.unit_of_measurement || ''} ${d.price_per_unit * d.count} (${d.price_per_unit} за ед.)`).join('\n') + '\n\n';
+                    }
                     const all_dops = await query(`SELECT * FROM nc WHERE zavod=? AND \`key\`=? AND rod_id=-1`, [(await getUser(ctx.from.id)).zavod, 'Equimpent']);
                     let but = all_dops.map(s => [{text: `${s.name}`, callback_data: `dop:${s.fid}`}]);
                     but.push([{text: 'Далее', callback_data: 'next'}]);
                     but.push([{text: '❌ Отмена', callback_data: 'stopscene'}]);
-                    await ctx.editMessageReplyMarkup({
-                        inline_keyboard: but
-                    });
+                    await ctx.editMessageText(
+                        `${selectedText}<b>Выберите доп. услуги к заявке:</b>`,
+                        {parse_mode: 'HTML', reply_markup: {inline_keyboard: but}}
+                    );
                 }
                 else if(ctx.callbackQuery.data === `next`){
                     ctx.deleteMessage(ctx.wizard.state.messageId)
@@ -1416,6 +1574,48 @@ module.exports.setupScenes = () => {
                     ctx.wizard.state.messageId = s.message_id;
                     return ctx.wizard.next();
                 }
+                else if(ctx.callbackQuery.data.startsWith('dop_count:')){
+                    const [_, id, count] = ctx.callbackQuery.data.split(':');
+                    const dop = (await query(`SELECT * FROM nc WHERE fid=?`, [id]))[0];
+                    if(dop){
+                        if(!ctx.wizard.state.dop){
+                            ctx.wizard.state.dop = [];
+                        }
+                        ctx.wizard.state.dop.push({...dop, count: parseInt(count)});
+                        await ctx.answerCbQuery(`✅ Добавлено: ${dop.name} (${count} ${dop.unit_of_measurement})`);
+                        // Вернуть обычную клавиатуру допов
+                        const all_dops = await query(`SELECT * FROM nc WHERE zavod=? AND \`key\`=? AND rod_id=-1`, [(await getUser(ctx.from.id)).zavod, 'Equimpent']);
+                        let but = all_dops.map(s => [{text: `${s.name}`, callback_data: `dop:${s.fid}`}]);
+                        but.push([{text: 'Далее', callback_data: 'next'}]);
+                        but.push([{text: '❌ Отмена', callback_data: 'stopscene'}]);
+                        await ctx.editMessageReplyMarkup({inline_keyboard: but});
+                    }
+                }
+            }
+            else if(ctx.wizard.state.pendingDop && ctx.message?.text){
+                const dop = ctx.wizard.state.pendingDop;
+                const count = parseInt(ctx.message.text);
+                if(isNaN(count) || count < 1 || count > dop.multiplicity){
+                    await ctx.replyWithHTML(`❌ Введите число от 1 до ${dop.multiplicity}`);
+                    return;
+                }
+                ctx.wizard.state.dop.push({...dop, count});
+                delete ctx.wizard.state.pendingDop;
+                // Формируем текст с выбранными доп. услугами
+                let selectedText = '';
+                if(ctx.wizard.state.dop && ctx.wizard.state.dop.length > 0){
+                    selectedText = '<b>Вы выбрали:</b>\n' + ctx.wizard.state.dop.map(d => `• ${d.name} — <b>${d.count}x</b> ${d.unit_of_measurement || ''} ${d.price_per_unit * d.count} (${d.price_per_unit} за ед.)`).join('\n') + '\n\n';
+                }
+                // вернуть клавиатуру допов
+                const all_dops = await query(`SELECT * FROM nc WHERE zavod=? AND \`key\`=? AND rod_id=-1`, [(await getUser(ctx.from.id)).zavod, 'Equimpent']);
+                let but = all_dops.map(s => [{text: `${s.name}`, callback_data: `dop:${s.fid}`}]);
+                but.push([{text: 'Далее', callback_data: 'next'}]);
+                but.push([{text: '❌ Отмена', callback_data: 'stopscene'}]);
+                await ctx.replyWithHTML(
+                    `${selectedText}<b>Выберите доп. услуги к заявке:</b>`,
+                    {reply_markup: {inline_keyboard: but}}
+                );
+                return;
             }
         },
         async (ctx) => {
@@ -1592,8 +1792,8 @@ module.exports.setupScenes = () => {
                     let dops = ``;
                     let price_dop = 0
                     for(const dop of s.dop){
-                        dops += `\n• ${dop.name} - ${dop.price_per_unit} руб.`
-                        price_dop += dop.price_per_unit;
+                        dops += `\n• ${dop.name} — ${dop.price_per_unit * dop.count} руб. <b>${dop.count}x</b> ${dop.unit_of_measurement || ''}`
+                        price_dop += dop.price_per_unit * dop.count;
                     }
                     const betont = (await query(`SELECT * FROM nc WHERE fid=?`,[s.betonType]))[0].name
                     const res = await createForm({
@@ -1603,13 +1803,13 @@ module.exports.setupScenes = () => {
                         place: s.place,
                         phone: s.phone,
                         betonType: betont,
-                        betonAmount: parseInt(s.amount),
+                        betonAmount: toFloat(s.amount),
                         betonUserPrice: parseInt(s.userPrice),
                         betonPrice: parseInt(s.price),
                         payForm: f || payForms[s.payForm],
-                        deliveryPriceWithAdd: deliveryp,
-                        deliveryPrice: s.delivery.price,
-                        deliveryAmount: s.delivery.amount,
+                        deliveryPriceWithAdd: toFloat(deliveryp),
+                        deliveryPrice: toFloat(s.delivery.price),
+                        deliveryAmount: toFloat(s.delivery.amount),
                         dopAll: dops,
                         dopPrice: price_dop,
                         enterPrice: s.enterPrice,
@@ -1626,11 +1826,39 @@ module.exports.setupScenes = () => {
                     })
                     if(res){
                         ctx.replyWithHTML(`<b>Заявка успешно создана под номером #${res}. Она будет отображаться в: "📋 Мои заявки"</b>`)
+                    
+                        if(user.zavod > -1){
+                            const zavod = await db.getZavod(user.zavod);
+                            if(zavod && zavod?.group !== -1){
+                                try{
+                                    ctx.telegram.sendMessage(zavod.group, `<b>${status[user.status]} ${user.real_name || `Неизвестное имя`} (TG: ${ctx.from.first_name} @${ctx.from.username})
+
+                                        Действие:</b> создал менеджерскую заявку #${res}:
+                                        
+                                        <b>1) ${s.date} | ${s.timeInterval}
+                                        2) ${s.place}
+                                        3) ${s.phone}
+                                        4) ${betont}
+                                        5) Бетон ${s.amount}м³ * ${s.userPrice} (прайс ${s.price})
+                                        6) ${f || payForms[s.payForm]}
+                                        7) доставка: ${deliveryp} за ${s.delivery.amount} (прайс ${s.delivery.price})
+                                        8) Допы (${price_dop} руб.): ${dops}
+                                        9) Вход ${s.enterPrice} руб.
+                                        10) Выход ${s.exitPrice} руб.
+                                        11) ${s.com}
+                                        12) ${(await getUser(ctx.from.id)).real_name}</b>`, {parse_mode:'HTML'})
+                                }catch(e){
+                                    console.log(e)
+                                }
+                            }
+                        }
                     }
                 }
             }
         },
     );
+
+    
 
     const editmedia_form= new Scenes.WizardScene(
         'editmedia_form',
@@ -1691,9 +1919,24 @@ module.exports.setupScenes = () => {
     const edit_form= new Scenes.WizardScene(
         'edit_form',
         async (ctx) => {
-            if(ctx.wizard.state.type === 0 || ctx.wizard.state.type === 1 || ctx.wizard.state.type === 3){
+            if(ctx.wizard.state.type === 1 || ctx.wizard.state.type === 3){
                 const s = await ctx.replyWithHTML(editTypes[ctx.wizard.state.type].text, {reply_markup: {inline_keyboard: [[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
                 ctx.wizard.state.messageId = s.message_id;
+            }
+            else if(ctx.wizard.state.type === 0){
+                const calendarKeyboard = calendar.getCalendar(new Date())
+                const cancelButton = Markup.button.callback('❌ Отмена', 'stopscene');
+                const s = await ctx.replyWithHTML(`📆 <b>Укажите дату и время когда требуется бетон</b>`, { reply_markup: { inline_keyboard: [
+                            ...calendarKeyboard.reply_markup.inline_keyboard,
+                            [cancelButton]
+                        ]
+                    }});
+                ctx.wizard.state.messageId = s.message_id;
+                const now = new Date();
+                ctx.wizard.state.calendarMessageId = s.message_id;
+                ctx.wizard.state.currentMonth = now.getMonth();
+                ctx.wizard.state.currentYear = now.getFullYear();
+                return ctx.wizard.next();
             }
             else if (ctx.wizard.state.type === 2){
                 const allBeton = await query(`SELECT * FROM nc WHERE zavod=? AND \`key\`=?`, [(await getUser(ctx.from.id)).zavod, `Beton`])
@@ -1725,6 +1968,74 @@ module.exports.setupScenes = () => {
                 if(ctx.callbackQuery.data === `stopscene`){
                     ctx.deleteMessage();
                     return await ctx.scene.leave();
+                }
+                else if(ctx.wizard.state.type === 0){
+                    
+                    if (ctx.callbackQuery.data.startsWith('calendar-telegram-prev')) {
+                        const { currentMonth, currentYear } = ctx.wizard.state;
+                        const prevMonth = currentMonth === 0 ? 11 : currentMonth - 1;
+                        const prevYear = currentMonth === 0 ? currentYear - 1 : currentYear;
+
+                        ctx.wizard.state.currentMonth = prevMonth;
+                        ctx.wizard.state.currentYear = prevYear;
+
+                        const newDate = new Date(prevYear, prevMonth, 1);
+                        const newCalendar = calendar.getCalendar(newDate);
+
+                        await ctx.editMessageReplyMarkup({
+                            inline_keyboard: [
+                                ...newCalendar.reply_markup.inline_keyboard,
+                                [Markup.button.callback('❌ Отмена', 'stopscene')]
+                            ]
+                        });
+                        return;
+                    }
+                    if (ctx.callbackQuery.data.startsWith('calendar-telegram-next')) {
+                        const { currentMonth, currentYear } = ctx.wizard.state;
+                        const nextMonth = currentMonth === 11 ? 0 : currentMonth + 1;
+                        const nextYear = currentMonth === 11 ? currentYear + 1 : currentYear;
+
+                        ctx.wizard.state.currentMonth = nextMonth;
+                        ctx.wizard.state.currentYear = nextYear;
+
+                        const newDate = new Date(nextYear, nextMonth, 1);
+                        const newCalendar = calendar.getCalendar(newDate);
+
+                        await ctx.editMessageReplyMarkup({
+                            inline_keyboard: [
+                                ...newCalendar.reply_markup.inline_keyboard,
+                                [Markup.button.callback('❌ Отмена', 'stopscene')]
+                            ]
+                        });
+                        return;
+                    }
+                    else if (ctx.callbackQuery.data.startsWith('calendar-telegram-ignore')) {
+                        return ctx.answerCbQuery();
+                    }
+                    else if (ctx.callbackQuery.data.startsWith('calendar-telegram')) {
+                        const dateStr = ctx.callbackQuery.data.replace('calendar-telegram-date-', '');
+                        const [year, month, day] = dateStr.split('-').map(Number);
+                        const date = new Date(year, month - 1, day);
+                        await ctx.deleteMessage(ctx.wizard.state.messageId)
+                        ctx.wizard.state.date = date.toLocaleDateString('ru-RU');
+
+
+                        const timeKeyboard = Markup.inlineKeyboard([
+                            [
+                                Markup.button.callback('🌅 Утро (8:00-11:00)', 'interval_8_11'),
+                                Markup.button.callback('🌇 День (13:00-16:00)', 'interval_13_16')
+                            ],
+                            [Markup.button.callback('⏱ Выбрать вручную', 'manual_time')],
+                            [Markup.button.callback('❌ Отмена', 'stopscene')]
+                        ]);
+
+
+                        const s = await ctx.replyWithHTML(`⏰ <b>Выберите интервал доставки (от 7:00 до 18:00):</b>`,
+                            timeKeyboard);
+                        ctx.wizard.state.messageId = s.message_id;
+                        ctx.wizard.state.timeSelectionStage = 'start';
+                        return ctx.wizard.next();
+                    }
                 }
                 else if(ctx.callbackQuery.data.startsWith(`type_`)){
                     ctx.deleteMessage(ctx.wizard.state.messageId)
@@ -1798,9 +2109,180 @@ module.exports.setupScenes = () => {
             else{
                 await ctx.deleteMessage(ctx.wizard.state.messageId)
                 await ctx.deleteMessage()
-                await query(`UPDATE forms SET ${editTypes[ctx.wizard.state.type].key}=? WHERE fid=${ctx.wizard.state.fid}`, [ctx.message.text])
+                if(ctx.wizard.state.type === 4){
+                    const input = ctx.message.text.split('/');
+                    if(input.length === 3){
+                        ctx.wizard.state.delivery = {
+                            price: toFloat(input[0]),
+                            price_with_add: toFloat(input[1]),
+                            amount: toFloat(input[2])
+                        }
+                    }
+                    else if(input.length === 2){
+                        ctx.wizard.state.delivery = {
+                            price: toFloat(input[0]),
+                            amount: toFloat(input[1]),
+                            price_with_add: null
+                        }
+                    }
+                    else{
+                        return ctx.replyWithHTML(`<b>Введите по форме!</b>`)
+                    }
+                    await query(`UPDATE forms SET deliveryPriceWithAdd=?, deliveryPrice=?, deliveryAmount=? WHERE fid=${ctx.wizard.state.fid}`, [ctx.wizard.state.delivery.price_with_add === null ? toFloat(ctx.wizard.state.delivery.price) : toFloat(ctx.wizard.state.delivery.price_with_add), toFloat(ctx.wizard.state.delivery.price), toFloat(ctx.wizard.state.delivery.amount)])
+
+                }
+                else{
+                    await query(`UPDATE forms SET ${editTypes[ctx.wizard.state.type].key}=? WHERE fid=${ctx.wizard.state.fid}`, [ctx.message.text])
+                }
+
+                if(ctx.wizard.state.type === 1){
+                    const user = await db.getUser(ctx.from.id);
+                    if(user.zavod > -1){
+                        const zavod = await db.getZavod(user.zavod);
+                        if(zavod && zavod.group !== -1){
+                            ctx.telegram.sendMessage(zavod.group, `<b>${status[user.status]} ${user.real_name || `Неизвестное имя`} (TG: ${ctx.from.first_name} @${ctx.from.username})
+
+Действие:</b> изменил кубатуру на заявке #${ctx.wizard.state.fid}, новая кубатура: ${ctx.message.text} м³`, {parse_mode:'HTML'})
+                        }
+                    }
+                }
+
                 index.openAncet(ctx, ctx.wizard.state.fid, 1)
                 return ctx.scene.leave();
+            }
+        },
+        async (ctx) => {
+            if(ctx.callbackQuery){
+                if(ctx.callbackQuery.data === `stopscene`){
+                    ctx.deleteMessage();
+                    return await ctx.scene.leave();
+                }
+
+                if (ctx.callbackQuery.data.startsWith('interval_')) {
+                    const [start, end] = ctx.callbackQuery.data.replace('interval_', '').split('_').map(Number);
+                    ctx.wizard.state.timeInterval = `${start}:00 - ${end}:00`;
+                    ctx.wizard.state.startHour = start;
+                    ctx.wizard.state.endHour = end;
+
+                    await ctx.deleteMessage(ctx.wizard.state.messageId);
+
+                    await query(`UPDATE forms SET date=? WHERE fid=${ctx.wizard.state.fid}`, [`${ctx.wizard.state.date} | ${ctx.wizard.state.timeInterval}`])
+                    index.openAncet(ctx, ctx.wizard.state.fid, 1)
+                    const user = await db.getUser(ctx.from.id);
+                    if(user.zavod > -1){
+                        const zavod = await db.getZavod(user.zavod);
+                        if(zavod && zavod.group !== -1){
+                            ctx.telegram.sendMessage(zavod.group, `<b>${status[user.status]} ${user.real_name || `Неизвестное имя`} (TG: ${ctx.from.first_name} @${ctx.from.username})
+
+Действие:</b> изменил дату на заявке #${ctx.wizard.state.fid}, новая дата: ${ctx.wizard.state.date} | ${ctx.wizard.state.timeInterval}`, {parse_mode:'HTML'})
+                        }
+                    }
+                    return ctx.scene.leave();
+                }
+
+                if (ctx.callbackQuery.data === 'manual_time') {
+                    const hours = Array.from({length: 12}, (_, i) => i + 7);
+                    const timeButtons = hours.map(h =>
+                        Markup.button.callback(`${h}:00`, `time_${h}`)
+                    );
+
+                    await ctx.editMessageText(
+                        `⏰ <b>Выберите начальное время (7:00-18:00):</b>`,
+                        { parse_mode: 'HTML',
+                            reply_markup: {
+                                inline_keyboard: [
+                                    ...chunkArray(timeButtons, 4),
+                                    [
+                                        Markup.button.callback('◀️ Назад', 'time_back'),
+                                        Markup.button.callback('❌ Отмена', 'stopscene')
+                                    ]
+                                ]
+                            }
+                        }
+                    );
+
+                    ctx.wizard.state.timeSelectionStage = 'start';
+                    return;
+                }
+
+                if (ctx.callbackQuery.data.startsWith('time_')) {
+                    const selectedHour = parseInt(ctx.callbackQuery.data.replace('time_', ''));
+
+                    if (ctx.wizard.state.timeSelectionStage === 'start') {
+                        ctx.wizard.state.startHour = selectedHour;
+                        ctx.wizard.state.timeSelectionStage = 'end';
+
+                        const minEnd = selectedHour + 1;
+                        const maxEnd = Math.min(selectedHour + 3, 18);
+                        const endHours = Array.from({length: maxEnd - minEnd + 1}, (_, i) => minEnd + i);
+
+                        const endButtons = endHours.map(h =>
+                            Markup.button.callback(`${h}:00`, `time_${h}`)
+                        );
+
+                        await ctx.editMessageText(
+                            `⏰ Вы выбрали начало в ${selectedHour}:00\n` +
+                            `<b>Выберите конечное время (до ${maxEnd}:00):</b>`,
+                            { parse_mode: 'HTML',
+                                reply_markup: {
+                                    inline_keyboard: [
+                                        ...chunkArray(endButtons, 3),
+                                        [
+                                            Markup.button.callback('◀️ Назад', 'time_back'),
+                                            Markup.button.callback('❌ Отмена', 'stopscene')
+                                        ]
+                                    ]
+                                }
+                            }
+                        );
+                    } else if (ctx.wizard.state.timeSelectionStage === 'end') {
+                        const startHour = ctx.wizard.state.startHour;
+                        const endHour = selectedHour;
+
+                        if (endHour <= startHour || endHour > startHour + 3) {
+                            await ctx.answerCbQuery('❌ Интервал должен быть от 1 до 3 часов');
+                            return;
+                        }
+
+                        ctx.wizard.state.endHour = endHour;
+                        ctx.wizard.state.timeInterval = `${startHour}:00 - ${endHour}:00`;
+
+                        await ctx.deleteMessage(ctx.wizard.state.messageId);
+                        await query(`UPDATE forms SET date=? WHERE fid=${ctx.wizard.state.fid}`, [`${ctx.wizard.state.date} | ${ctx.wizard.state.timeInterval}`])
+                        index.openAncet(ctx, ctx.wizard.state.fid, 1)
+
+                        const user = await db.getUser(ctx.from.id);
+                        if(user.zavod > -1){
+                            const zavod = await db.getZavod(user.zavod);
+                            if(zavod && zavod.group !== -1){
+                                ctx.telegram.sendMessage(zavod.group, `<b>${status[user.status]} ${user.real_name || `Неизвестное имя`} (TG: ${ctx.from.first_name} @${ctx.from.username})
+
+Действие:</b> изменил дату на заявке #${ctx.wizard.state.fid}, новая дата: ${ctx.wizard.state.date} | ${ctx.wizard.state.timeInterval}`, {parse_mode:'HTML'})
+                            }
+                        }
+
+                        return ctx.scene.leave();
+                    }
+                }
+
+                if (ctx.callbackQuery.data === 'time_back') {
+                    const timeKeyboard = Markup.inlineKeyboard([
+                        [
+                            Markup.button.callback('🌅 Утро (8:00-11:00)', 'interval_8_11'),
+                            Markup.button.callback('🌇 День (13:00-16:00)', 'interval_13_16')
+                        ],
+                        [Markup.button.callback('⏱ Выбрать вручную', 'manual_time')],
+                        [Markup.button.callback('❌ Отмена', 'stopscene')]
+                    ]);
+
+                    await ctx.editMessageText(
+                        `⏰ <b>Выберите временной интервал доставки:</b>`,
+                        {parse_mode: 'HTML',
+                            ...timeKeyboard}
+                    );
+
+                    delete ctx.wizard.state.timeSelectionStage;
+                }
             }
         },
     );
@@ -1834,6 +2316,8 @@ module.exports.setupScenes = () => {
                     ctx.wizard.state.betonType = parseInt(ctx.callbackQuery.data.split('_')[1]);
                     const s = await ctx.replyWithHTML(`⚖️ <b>Укажите объем/цену за кубометр со скидкой 
 ❗️Если цена по прайсу, напишите только объем❗️
+❗️Если нецелое число, то вводите через точку или запятую❗️
+Выбранная вами марка: ${await db.getBetonName(ctx.wizard.state.betonType)}
 
 (Пример 10/7000)</b>`, {reply_markup: {inline_keyboard: [[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
                     ctx.wizard.state.messageId = s.message_id;
@@ -1853,14 +2337,13 @@ module.exports.setupScenes = () => {
             const input = ctx.message.text.split('/');
             const price = await query(`SELECT * FROM nc WHERE fid=?`, [ctx.wizard.state.betonType]);
             if(input.length === 2 && !isNaN(input[0]) && !isNaN(input[1])){
-                ctx.wizard.state.amount = input[0];
-                ctx.wizard.state.userPrice = input[1];
+                ctx.wizard.state.amount = toFloat(input[0]);
+                ctx.wizard.state.userPrice = toFloat(input[1]);
                 ctx.wizard.state.price = price[0].price_per_unit;
             }
             else{
-                
                 if(price.length > 0){
-                    ctx.wizard.state.amount = ctx.message.text;
+                    ctx.wizard.state.amount = toFloat(ctx.message.text);
                     ctx.wizard.state.price = price[0].price_per_unit;
                     ctx.wizard.state.userPrice = price[0].price_per_unit;
                 }
@@ -1872,9 +2355,9 @@ module.exports.setupScenes = () => {
             }
             const s = await ctx.replyWithHTML(`<b>Обьем: ${ctx.wizard.state.amount} м³
 Цена: ${ctx.wizard.state.userPrice} руб/м³
-Итоговая цена: ${ctx.wizard.state.amount * ctx.wizard.state.userPrice} руб
+Итоговая цена: ${Math.round(ctx.wizard.state.amount * ctx.wizard.state.userPrice)} руб
                 
-💸 Выберите форму оплаты</b>`, {reply_markup: {inline_keyboard: [[{text: 'По факту на месте', callback_data: 'pay_form:0'}],[{text: 'Предоплата', callback_data: 'pay_form:1'}],[{text: 'Предоплата %', callback_data: 'pay_form:2'}],[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
+💸 Выберите форму оплаты</b>`, {reply_markup: {inline_keyboard: [[{text: 'По факту на месте', callback_data: 'pay_form:0'}],[{text: 'Предоплата', callback_data: 'pay_form:1'}],[{text: 'Предоплата % или руб.', callback_data: 'pay_form:2'}],[{text: 'Постоплата', callback_data: 'pay_form:3'}],[{text: 'Не указывать', callback_data: 'pay_form:4'}],[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
             ctx.wizard.state.messageId = s.message_id;
             return ctx.wizard.next();
         },
@@ -1890,17 +2373,19 @@ module.exports.setupScenes = () => {
                     if(form !== 2){
                         ctx.wizard.state.payForm = form;
                         const s = await ctx.replyWithHTML(`<b>📦 Укажите: доставка по прайсу куб/Доставка за куб/количество кубов на доставку, или же: доставка по прайсу куб/количество кубов на доставку
+
+Ваш объем: ${ctx.wizard.state.amount} м³
                             
 Пример 
 900/10 (продажа без скидки)
-800/900/10 (продажа со скидкой)</b>`, {reply_markup: {inline_keyboard: [[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
+900/800/10 (продажа со скидкой)</b>`, {reply_markup: {inline_keyboard: [[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
                         ctx.wizard.state.messageId = s.message_id;
                         return ctx.wizard.next();
                     }
                     else{
                         ctx.wizard.state.payForm = form;
                         ctx.wizard.state.enterProc = true;
-                        const s = await ctx.replyWithHTML(`📎 <b>Введите процент предоплаты</b>`, {reply_markup: {inline_keyboard: [[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
+                        const s = await ctx.replyWithHTML(`📎 <b>Введите процент или сумму предоплаты</b>`, {reply_markup: {inline_keyboard: [[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
                         ctx.wizard.state.messageId = s.message_id;
                     }
                 }
@@ -1910,7 +2395,13 @@ module.exports.setupScenes = () => {
                 await ctx.deleteMessage(ctx.wizard.state.messageId)
                 delete ctx.wizard.state.enterProc;
                 ctx.wizard.state.payFormProcent = parseInt(ctx.message.text);
-                const s = await ctx.replyWithHTML(`<b>📦 Укажите: доставка по прайсу куб/Доставка за куб/количество кубов на доставку, или же: доставка по прайсу куб/количество кубов на доставку</b>`, {reply_markup: {inline_keyboard: [[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
+                const s = await ctx.replyWithHTML(`<b>📦 Укажите: доставка по прайсу куб/Доставка за куб/количество кубов на доставку, или же: доставка по прайсу куб/количество кубов на доставку
+
+Ваш объем: ${ctx.wizard.state.amount} м³
+                            
+Пример 
+900/10 (продажа без скидки)
+900/800/10 (продажа со скидкой)</b>`, {reply_markup: {inline_keyboard: [[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
                 ctx.wizard.state.messageId = s.message_id;
                 return ctx.wizard.next();
             }
@@ -1927,15 +2418,15 @@ module.exports.setupScenes = () => {
             const input = ctx.message.text.split('/');
             if(input.length === 3){
                 ctx.wizard.state.delivery = {
-                    price: input[0],
-                    price_with_add: input[1],
-                    amount: input[2]
+                    price: toFloat(input[0]),
+                    price_with_add: toFloat(input[1]),
+                    amount: toFloat(input[2])
                 }
             }
             else if(input.length === 2){
                 ctx.wizard.state.delivery = {
-                    price: input[0],
-                    amount: input[1],
+                    price: toFloat(input[0]),
+                    amount: toFloat(input[1]),
                     price_with_add: null
                 }
             }
@@ -1986,31 +2477,139 @@ module.exports.setupScenes = () => {
                         if(!ctx.wizard.state.dop){
                             ctx.wizard.state.dop = [];
                         }
-                        ctx.wizard.state.dop.push(dop);
-                        await ctx.answerCbQuery(`✅ Доп. услуга ${dop.name} добавлена`);
-                        const all_dops = await query(`SELECT * FROM nc WHERE zavod=? AND \`key\`=? AND rod_id=-1`, [(await getUser(ctx.from.id)).zavod, 'Equimpent']);
-                        let but = all_dops.map(s => [{text: `${s.name}`, callback_data: `dop:${s.fid}`}]);
-                        but.push([{text: 'Далее', callback_data: 'next'}]);
-                        but.push([{text: '❌ Отмена', callback_data: 'stopscene'}]);
-                        await ctx.editMessageReplyMarkup({
-                            inline_keyboard: but
-                        });
+                        if(dop.multiplicity > 1){
+                            ctx.wizard.state.pendingDop = dop;
+                            await ctx.replyWithHTML(
+                                `Введите количество для <b>${dop.name}</b> (максимум: ${dop.multiplicity}):`,
+                                {reply_markup: {inline_keyboard: [[{text: 'Отмена', callback_data: 'back_dop'}]]}}
+                            );
+                        }
+                        else{
+                            ctx.deleteMessage();
+                            const count = 1;
+                            ctx.wizard.state.dop.push({...dop, count});
+                            // Формируем текст с выбранными доп. услугами
+                            let selectedText = '';
+                            if(ctx.wizard.state.dop && ctx.wizard.state.dop.length > 0){
+                                selectedText = '<b>Вы выбрали:</b>\n' + ctx.wizard.state.dop.map(d => `• ${d.name} — <b>${d.count}x</b> ${d.unit_of_measurement || ''} ${d.price_per_unit * d.count} (${d.price_per_unit} за ед.)`).join('\n') + '\n\n';
+                            }
+                            // вернуть клавиатуру допов
+                            const all_dops = await query(`SELECT * FROM nc WHERE zavod=? AND \`key\`=? AND rod_id=-1`, [(await getUser(ctx.from.id)).zavod, 'Equimpent']);
+                            let but = all_dops.map(s => [{text: `${s.name}`, callback_data: `dop:${s.fid}`}]);
+                            but.push([{text: 'Далее', callback_data: 'next'}]);
+                            but.push([{text: '❌ Отмена', callback_data: 'stopscene'}]);
+                            await ctx.replyWithHTML(
+                                `${selectedText}<b>Выберите доп. услуги к заявке:</b>`,
+                                {reply_markup: {inline_keyboard: but}}
+                            );
+                            return;
+                        }
                     }
                 }
                 else if(ctx.callbackQuery.data === 'back_dop'){
+                    // Формируем текст с выбранными доп. услугами
+                    let selectedText = '';
+                    if(ctx.wizard.state.dop && ctx.wizard.state.dop.length > 0){
+                        selectedText = '<b>Вы выбрали:</b>\n' + ctx.wizard.state.dop.map(d => `• ${d.name} — <b>${d.count}x</b> ${d.unit_of_measurement || ''} ${d.price_per_unit * d.count} (${d.price_per_unit} за ед.)`).join('\n') + '\n\n';
+                    }
                     const all_dops = await query(`SELECT * FROM nc WHERE zavod=? AND \`key\`=? AND rod_id=-1`, [(await getUser(ctx.from.id)).zavod, 'Equimpent']);
                     let but = all_dops.map(s => [{text: `${s.name}`, callback_data: `dop:${s.fid}`}]);
                     but.push([{text: 'Далее', callback_data: 'next'}]);
                     but.push([{text: '❌ Отмена', callback_data: 'stopscene'}]);
-                    await ctx.editMessageReplyMarkup({
-                        inline_keyboard: but
-                    });
+                    await ctx.editMessageText(
+                        `${selectedText}<b>Выберите доп. услуги к заявке:</b>`,
+                        {parse_mode: 'HTML', reply_markup: {inline_keyboard: but}}
+                    );
                 }
                 else if(ctx.callbackQuery.data === `next`){
                     ctx.deleteMessage(ctx.wizard.state.messageId)
-                
+                    const s = await ctx.replyWithHTML(`📷 <b>Для наиболее грамотной поставки бетона пришлите фото/видео подъездных путей, так логисты смогут подобрать наиболее подходящий вариант для вашего объекта</b>`, {reply_markup: {inline_keyboard: [[{text: 'Продолжить без фото', callback_data: 'noPhoto'}],[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
+                    ctx.wizard.state.messageId = s.message_id;
+                    return ctx.wizard.next();
+                }
+                else if(ctx.callbackQuery.data.startsWith('dop_count:')){
+                    const [_, id, count] = ctx.callbackQuery.data.split(':');
+                    const dop = (await query(`SELECT * FROM nc WHERE fid=?`, [id]))[0];
+                    if(dop){
+                        if(!ctx.wizard.state.dop){
+                            ctx.wizard.state.dop = [];
+                        }
+                        ctx.wizard.state.dop.push({...dop, count: parseInt(count)});
+                        await ctx.answerCbQuery(`✅ Добавлено: ${dop.name} (${count} ${dop.unit_of_measurement})`);
+                        // Вернуть обычную клавиатуру допов
+                        const all_dops = await query(`SELECT * FROM nc WHERE zavod=? AND \`key\`=? AND rod_id=-1`, [(await getUser(ctx.from.id)).zavod, 'Equimpent']);
+                        let but = all_dops.map(s => [{text: `${s.name}`, callback_data: `dop:${s.fid}`}]);
+                        but.push([{text: 'Далее', callback_data: 'next'}]);
+                        but.push([{text: '❌ Отмена', callback_data: 'stopscene'}]);
+                        await ctx.editMessageReplyMarkup({inline_keyboard: but});
+                    }
+                }
+            }
+            else if(ctx.wizard.state.pendingDop && ctx.message?.text){
+                const dop = ctx.wizard.state.pendingDop;
+                const count = parseInt(ctx.message.text);
+                if(isNaN(count) || count < 1 || count > dop.multiplicity){
+                    await ctx.replyWithHTML(`❌ Введите число от 1 до ${dop.multiplicity}`);
+                    return;
+                }
+                ctx.wizard.state.dop.push({...dop, count});
+                delete ctx.wizard.state.pendingDop;
+                // Формируем текст с выбранными доп. услугами
+                let selectedText = '';
+                if(ctx.wizard.state.dop && ctx.wizard.state.dop.length > 0){
+                    selectedText = '<b>Вы выбрали:</b>\n' + ctx.wizard.state.dop.map(d => `• ${d.name} — <b>${d.count}x</b> ${d.unit_of_measurement || ''} ${d.price_per_unit * d.count} (${d.price_per_unit} за ед.)`).join('\n') + '\n\n';
+                }
+                // вернуть клавиатуру допов
+                const all_dops = await query(`SELECT * FROM nc WHERE zavod=? AND \`key\`=? AND rod_id=-1`, [(await getUser(ctx.from.id)).zavod, 'Equimpent']);
+                let but = all_dops.map(s => [{text: `${s.name}`, callback_data: `dop:${s.fid}`}]);
+                but.push([{text: 'Далее', callback_data: 'next'}]);
+                but.push([{text: '❌ Отмена', callback_data: 'stopscene'}]);
+                await ctx.replyWithHTML(
+                    `${selectedText}<b>Выберите доп. услуги к заявке:</b>`,
+                    {reply_markup: {inline_keyboard: but}}
+                );
+                return;
+            }
+        },
+        async (ctx) => {
+            if(ctx.callbackQuery){
+                if(ctx.callbackQuery.data === `stopscene`){
+                    ctx.deleteMessage();
+                    return await ctx.scene.leave();
+                }
+                else if(ctx.callbackQuery.data === `noPhoto`){
+                    await ctx.deleteMessage(ctx.wizard.state.messageId)
+                    ctx.wizard.state.photos = null;
+                    ctx.wizard.state.video = null;
                     resultPrice(ctx)
                 }
+                else if(ctx.callbackQuery.data === `stop`){
+                    await ctx.deleteMessage(ctx.wizard.state.messageId)
+                    resultPrice(ctx)
+                }
+            }
+            else if(ctx.message.photo){
+                if(!ctx.wizard.state.photo) ctx.wizard.state.photo = [];
+                await ctx.deleteMessage(ctx.wizard.state.messageId)
+                await ctx.deleteMessage()
+                ctx.wizard.state.photo.push(ctx.message.photo[ctx.message.photo.length - 1].file_id);
+                const s = await ctx.replyWithHTML(`📷 <b>Добавлено фото!</b>`, {reply_markup: {inline_keyboard: [[{text: 'Закончить', callback_data: 'stop'}],[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
+                ctx.wizard.state.messageId = s.message_id;
+            }
+            else if(ctx.message.video){
+                if(!ctx.wizard.state.video) ctx.wizard.state.video = [];
+                await ctx.deleteMessage(ctx.wizard.state.messageId)
+                await ctx.deleteMessage()
+                ctx.wizard.state.video.push(ctx.message.video.file_id);
+                const s = await ctx.replyWithHTML(`📷 <b>Добавлено видео!</b>`, {reply_markup: {inline_keyboard: [[{text: 'Закончить', callback_data: 'stop'}],[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
+                ctx.wizard.state.messageId = s.message_id;
+            }
+            else{
+                await ctx.deleteMessage(ctx.wizard.state.messageId)
+                await ctx.deleteMessage()
+                const s = await ctx.replyWithHTML(`❌ <b>Требуется прислать фото/видео!</b>`, {reply_markup: {inline_keyboard: [[{text: 'Продолжить без фото', callback_data: 'noPhoto'}],[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
+                ctx.wizard.state.messageId = s.message_id;
+                return
             }
         },
         async (ctx) => {
@@ -2061,7 +2660,7 @@ module.exports.setupScenes = () => {
                     let price = parseInt(ctx.callbackQuery.data.split(':')[1]);
                     if(price !== -1){
                         ctx.wizard.state.exitPrice = price;
-                        const s = await last_calc(ctx)
+                        const s = await ctx.replyWithHTML(`✏️ <b>Введите комментарий к заявке (Пример: форма одежды, требуется ли интервал между машинами, пожелания по доставке)</b>`, {reply_markup: {inline_keyboard: [[{text: 'Продолжить без комментария', callback_data: 'nocom'}],[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
                         ctx.wizard.state.messageId = s.message_id;
                         return ctx.wizard.next();
                     }
@@ -2078,7 +2677,7 @@ module.exports.setupScenes = () => {
                 let price = parseInt(ctx.message.text);
                 if(price > 0){
                     ctx.wizard.state.exitPrice = price;
-                    const s = await last_calc(ctx)
+                    const s = await ctx.replyWithHTML(`✏️ <b>Введите комментарий к заявке (Пример: форма одежды, требуется ли интервал между машинами, пожелания по доставке)</b>`, {reply_markup: {inline_keyboard: [[{text: 'Продолжить без комментария', callback_data: 'nocom'}],[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
                     ctx.wizard.state.messageId = s.message_id;
                     return ctx.wizard.next();
                 }
@@ -2094,15 +2693,44 @@ module.exports.setupScenes = () => {
                     ctx.deleteMessage();
                     return await ctx.scene.leave();
                 }
+                else if(ctx.callbackQuery.data === `nocom`){
+                    await ctx.deleteMessage(ctx.wizard.state.messageId)
+                    ctx.wizard.state.com = 'Без комментария';
+                    const s = await last(ctx)
+                    ctx.wizard.state.messageId = s.message_id;
+                    return ctx.wizard.next();
+                }
+            }
+            await ctx.deleteMessage(ctx.wizard.state.messageId)
+            await ctx.deleteMessage()
+            ctx.wizard.state.com = ctx.message.text;
+            const s = await last(ctx)
+            ctx.wizard.state.messageId = s.message_id;
+            return ctx.wizard.next();
+        },
+        async (ctx) => {
+            if(ctx.callbackQuery){
+                if(ctx.callbackQuery.data === `stopscene`){
+                    ctx.deleteMessage();
+                    return await ctx.scene.leave();
+                }
                 else if(ctx.callbackQuery.data === `create_anc`){
                     await ctx.deleteMessage(ctx.wizard.state.messageId)
                     ctx.scene.leave();
                     const {id} = ctx.from
                     let user = await getUser(id);
                     const s = ctx.wizard.state;
-                    const an = ctx.wizard.state.an
-
-                    media = an.media;
+                    let media = [];
+                    let ph = [];
+                    let vd = [];
+                    if(ctx.wizard.state.photo !== undefined && ctx.wizard.state.photo?.length > 0){
+                        ph = ctx.wizard.state.photo.map((fileId) => {
+                        return {type: 'photo', fileId: fileId}});
+                    }
+                    if(ctx.wizard.state.video !== undefined && ctx.wizard.state.video?.length > 0){
+                        vd = ctx.wizard.state.video.map((fileId) => {return {type: 'video', fileId: fileId}});
+                    }
+                    media = JSON.stringify(media.concat(ph,vd));
                     
                     let f;
                     if(s.payForm === 2){
@@ -2117,43 +2745,61 @@ module.exports.setupScenes = () => {
                     let dops = ``;
                     let price_dop = 0
                     for(const dop of s.dop){
-                        dops += `\n• ${dop.name} - ${dop.price_per_unit} руб.`
-                        price_dop += dop.price_per_unit;
+                        dops += `\n• ${dop.name} — ${dop.price_per_unit * dop.count} руб. <b>${dop.count}x</b> ${dop.unit_of_measurement || ''}`
+                        price_dop += dop.price_per_unit * dop.count;
                     }
                     const betont = (await query(`SELECT * FROM nc WHERE fid=?`,[s.betonType]))[0].name
                     const res = await createForm({
-                        type: 2,
+                        type: 1,
                         created_by: ctx.from.id,
-                        date: an.date,
-                        place: an.place,
-                        phone: an.phone,
+                        date: `${s.date} | ${s.timeInterval}`,
+                        place: s.place,
+                        phone: s.phone,
                         betonType: betont,
-                        betonAmount: parseInt(s.amount),
+                        betonAmount: toFloat(s.amount),
                         betonUserPrice: parseInt(s.userPrice),
                         betonPrice: parseInt(s.price),
                         payForm: f || payForms[s.payForm],
-                        deliveryPriceWithAdd: deliveryp,
-                        deliveryPrice: s.delivery.price,
-                        deliveryAmount: s.delivery.amount,
+                        deliveryPriceWithAdd: toFloat(deliveryp),
+                        deliveryPrice: toFloat(s.delivery.price),
+                        deliveryAmount: toFloat(s.delivery.amount),
                         dopAll: dops,
                         dopPrice: price_dop,
                         enterPrice: s.enterPrice,
                         exitPrice: s.exitPrice,
-                        com: an.com,
+                        com: s.com,
                         real_name: user.real_name,
                         zavod: user.zavod,
                         status: 1,
-                        priv: an.created_by,
+                        priv: -1,
                         media: media,
-                        last_fid: an.fid
+                        last_fid: -1,
+                        entity: ctx.wizard.state.entity.type,
+                        entity_text: ctx.wizard.state.entity.text
                     })
                     if(res){
-                        ctx.replyWithHTML(`<b>Заявка успешно создана под номером #${res}. Она будет отображаться в: "📩 Входящие заявки"</b>`)
-                        if(ctx.wizard.state.an.to === -1){
-                            ctx.telegram.sendMessage(`<b>На вашу заявку откликнулся один из заводов! Посмотрите предложение в "🗂 Мои предложения"</b>`)
-                        }
-                        else if(ctx.wizard.state.an.to === (await getUser(ctx.from.id)).zavod){
-                            ctx.telegram.sendMessage(`<b>На вашу заявку откликнулся завод! Заявка находится в "🗂 Мои предложения"</b>`)
+                        ctx.replyWithHTML(`<b>Заявка успешно создана под номером #${res}. Она будет отображаться в: "📋 Мои заявки"</b>`)
+                    
+                        if(user.zavod > -1){
+                            const zavod = await db.getZavod(user.zavod);
+                            if(zavod && zavod.group !== -1){
+                                ctx.telegram.sendMessage(zavod.group, `<b>${status[user.status]} ${user.real_name || `Неизвестное имя`} (TG: ${ctx.from.first_name} @${ctx.from.username})
+
+Действие:</b> создал менеджерскую заявку #${res}:
+
+<b>1) ${s.date} | ${s.timeInterval}
+2) ${s.place}
+3) ${s.phone}
+4) ${betont}
+5) Бетон ${s.amount}м³ * ${s.userPrice} (прайс ${s.price})
+6) ${f || payForms[s.payForm]}
+7) доставка: ${deliveryp} за ${s.delivery.amount} (прайс ${s.delivery.price})
+8) Допы (${price_dop} руб.): ${dops}
+9) Вход ${s.enterPrice} руб.
+10) Выход ${s.exitPrice} руб.
+11) ${s.com}
+12) ${(await getUser(ctx.from.id)).real_name}</b>`, {parse_mode:'HTML'})
+                            }
                         }
                     }
                 }
@@ -2282,6 +2928,7 @@ module.exports.setupScenes = () => {
                             await ctx.telegram.sendMessage(car.driver, `<i>У вас новая заявка!</i>
     
     ❗️<b>Не забудьте завершить заявку после отливки в разделе ЗАЯВКИ В РАБОТЕ</b>`, {parse_mode: 'HTML'})
+                            index.openAncet(ctx, ctx.wizard.state.fid, 1, car.driver)
                         }
                         catch(e){
 
@@ -2575,6 +3222,37 @@ module.exports.setupScenes = () => {
                     `Замывка вне объекта`,
                 ]
             }
+            // Функция для вывода выбранных допов
+            function getSelectedText(dops) {
+                if (dops && dops.length > 0) {
+                    return 'Вы выбрали:\n' + dops.map(d => `✅ ${d.name} (${d.count} шт.)`).join('\n') + '\n\n';
+                }
+                return '';
+            }
+            // Функция для формирования клавиатуры
+            function getDopKeyboard(dops) {
+                let but = [];
+                for (const b of but_for_keyboard) {
+                    if (dops && dops.find(d => d.name === b))
+                        but.push([{text: '✅ ' + b, callback_data: `select:${b}`}]);
+                    else
+                        but.push([{text: b, callback_data: `select:${b}`}]);
+                }
+                // Кнопки для пользовательских допов
+                if (dops) {
+                    for (const d of dops) {
+                        if (!but_for_keyboard.includes(d.name)) {
+                            but.push([{text: `✅ ${d.name} (${d.count} шт.)`, callback_data: `remove_custom:${d.name}`}]);
+                        }
+                    }
+                }
+                but.push([{text: 'Другая услуга (ввести вручную)', callback_data: 'other_dop'}]);
+                if (dops && dops.length > 0) {
+                    but.push([{text: 'Продолжить', callback_data: 'next'}]);
+                }
+                but.push([{text: '❌ Отмена', callback_data: 'stopscene'}]);
+                return but;
+            }
             if(ctx.callbackQuery){
                 if(ctx.callbackQuery.data === 'stopscene'){
                     ctx.deleteMessage();
@@ -2583,96 +3261,248 @@ module.exports.setupScenes = () => {
                 else if(ctx.callbackQuery.data.startsWith('select:')){
                     ctx.deleteMessage();
                     if(!ctx.wizard.state.dop) ctx.wizard.state.dop = [];
-                    if(!ctx.wizard.state.dop_edit) ctx.wizard.state.dop_edit = [];
                     const data = ctx.callbackQuery.data.split(':')[1];
-                    if(ctx.wizard.state.dop[data]) delete ctx.wizard.state.dop[data];
-                    else ctx.wizard.state.dop[data] = data;
-    
-                    let but = [];
-                    for(const b of but_for_keyboard){
-                        if(ctx.wizard.state.dop[b]) but.push([{text: '✅ ' + b, callback_data: `select:${b}`}]);
-                        else but.push([{text: b, callback_data: `select:${b}`}]);
+                    // Если уже выбрана — убираем
+                    let idx = ctx.wizard.state.dop.findIndex(d => d.name === data);
+                    if(idx !== -1){
+                        ctx.wizard.state.dop.splice(idx, 1);
+                        const selectedText = getSelectedText(ctx.wizard.state.dop);
+                        const but = getDopKeyboard(ctx.wizard.state.dop);
+                        await ctx.replyWithHTML(selectedText + '<b>Какие доп. услуги были предоставлены? Если ваших услуг нет, то введите текстом</b>', {reply_markup: {inline_keyboard: but}});
+                        return;
                     }
-    
-                    for(const b in ctx.wizard.state.dop_edit){
-                        if(ctx.wizard.state.dop_edit[b]) but.push([{text: '✅ ' + b, callback_data: `none`}]);
-                    }
-                    but.push([{text: 'Продолжить', callback_data: 'next'}], [{text: '❌ Отмена', callback_data: 'stopscene'}]);
-
-                    const s = await ctx.replyWithHTML(`<b>Какие доп. услуги были предоставлены? Если ваших услуг нет, то введите текстом</b>`, {reply_markup: {inline_keyboard: but}});
-                    ctx.wizard.state.messageId = s.message_id;
+                    ctx.wizard.state.pendingDopName = data;
+                    await ctx.replyWithHTML(`Введите количество для <b>${data}</b> (положительное число):`, {reply_markup: {inline_keyboard: [[{text: 'Отмена', callback_data: 'back_dop'}]]}});
+                    return;
+                }
+                else if(ctx.callbackQuery.data.startsWith('remove_custom:')){
+                    ctx.deleteMessage();
+                    const name = ctx.callbackQuery.data.split(':')[1];
+                    if(ctx.wizard.state.dop) ctx.wizard.state.dop = ctx.wizard.state.dop.filter(d => d.name !== name);
+                    const selectedText = getSelectedText(ctx.wizard.state.dop);
+                    const but = getDopKeyboard(ctx.wizard.state.dop);
+                    await ctx.replyWithHTML(selectedText + '<b>Какие доп. услуги были предоставлены? Если ваших услуг нет, то введите текстом</b>', {reply_markup: {inline_keyboard: but}});
+                    return;
+                }
+                else if(ctx.callbackQuery.data === 'other_dop'){
+                    ctx.deleteMessage();
+                    ctx.wizard.state.pendingCustomDop = true;
+                    await ctx.replyWithHTML('Введите название вашей услуги:', {reply_markup: {inline_keyboard: [[{text: 'Отмена', callback_data: 'back_dop'}]]}});
+                    return;
+                }
+                else if(ctx.callbackQuery.data === 'back_dop'){
+                    // Вернуть клавиатуру выбора допов
+                    const selectedText = getSelectedText(ctx.wizard.state.dop);
+                    const but = getDopKeyboard(ctx.wizard.state.dop);
+                    await ctx.replyWithHTML(selectedText + '<b>Какие доп. услуги были предоставлены? Если ваших услуг нет, то введите текстом</b>', {reply_markup: {inline_keyboard: but}});
+                    return;
                 }
                 else if(ctx.callbackQuery.data === `next`){
                     ctx.deleteMessage();
                     const but = [[{text: '❌ Отмена', callback_data: 'stopscene'}]];
+                    but.push([{text: 'Продолжить без ТТН', callback_data: 'nottn'}])
                     const s = await ctx.replyWithHTML(`<b>Прикрепите к заявке фото ТТН</b>`, {reply_markup: {inline_keyboard: but}});
                     ctx.wizard.state.messageId = s.message_id;
                     return ctx.wizard.next()
                 }
             }
-            else if(ctx.message?.text){
-                ctx.deleteMessage(ctx.wizard.state.messageId)
-                ctx.deleteMessage();
+            else if(ctx.wizard.state.pendingDopName && ctx.message?.text){
+                // Ожидаем количество для выбранной услуги
+                const name = ctx.wizard.state.pendingDopName;
+                const count = parseInt(ctx.message.text);
+                if(isNaN(count) || count < 1 || count > 100){
+                    await ctx.replyWithHTML(`❌ Введите число от 1 до 100`);
+                    return;
+                }
                 if(!ctx.wizard.state.dop) ctx.wizard.state.dop = [];
-                if(!ctx.wizard.state.dop_edit) ctx.wizard.state.dop_edit = [];
-                const data = ctx.message.text;
-                if(ctx.wizard.state.dop_edit[data]) delete ctx.wizard.state.dop_edit[data];
-                else ctx.wizard.state.dop_edit[data] = data;
-
-                let but = [];
-                for(const b of but_for_keyboard){
-                    if(ctx.wizard.state.dop[b]) but.push([{text: '✅ ' + b, callback_data: `select:${b}`}]);
-                    else but.push([{text: b, callback_data: `select:${b}`}]);
+                let existing = ctx.wizard.state.dop.find(d => d.name === name);
+                if(existing){
+                    existing.count += count;
+                } else {
+                    ctx.wizard.state.dop.push({name, count});
                 }
-
-                for(const b in ctx.wizard.state.dop_edit){
-                    if(ctx.wizard.state.dop_edit[b]) but.push([{text: '✅ ' + b, callback_data: `none`}]);
+                delete ctx.wizard.state.pendingDopName;
+                const selectedText = getSelectedText(ctx.wizard.state.dop);
+                const but = getDopKeyboard(ctx.wizard.state.dop);
+                await ctx.replyWithHTML(selectedText + '<b>Какие доп. услуги были предоставлены? Если ваших услуг нет, то введите текстом</b>', {reply_markup: {inline_keyboard: but}});
+                return;
+            }
+            else if(ctx.wizard.state.pendingCustomDop && ctx.message?.text){
+                // Ожидаем название услуги
+                ctx.wizard.state.customDopName = ctx.message.text;
+                delete ctx.wizard.state.pendingCustomDop;
+                await ctx.replyWithHTML(`Введите количество для <b>${ctx.wizard.state.customDopName}</b> (положительное число):`, {reply_markup: {inline_keyboard: [[{text: 'Отмена', callback_data: 'back_dop'}]]}});
+                return;
+            }
+            else if(ctx.wizard.state.customDopName && ctx.message?.text){
+                // Ожидаем количество для своей услуги
+                const name = ctx.wizard.state.customDopName;
+                const count = parseInt(ctx.message.text);
+                if(isNaN(count) || count < 1 || count > 500){
+                    await ctx.replyWithHTML(`❌ Введите число от 1 до 100`);
+                    return;
                 }
-                but.push([{text: 'Продолжить', callback_data: 'next'}], [{text: '❌ Отмена', callback_data: 'stopscene'}]);
-
-                const s = await ctx.replyWithHTML(`<b>Какие доп. услуги были предоставлены? Если ваших услуг нет, то введите текстом</b>`, {reply_markup: {inline_keyboard: but}});
-                ctx.wizard.state.messageId = s.message_id;
+                if(!ctx.wizard.state.dop) ctx.wizard.state.dop = [];
+                let existing = ctx.wizard.state.dop.find(d => d.name === name);
+                if(existing){
+                    existing.count += count;
+                } else {
+                    ctx.wizard.state.dop.push({name, count});
+                }
+                delete ctx.wizard.state.customDopName;
+                const selectedText = getSelectedText(ctx.wizard.state.dop);
+                const but = getDopKeyboard(ctx.wizard.state.dop);
+                await ctx.replyWithHTML(selectedText + '<b>Какие доп. услуги были предоставлены? Если ваших услуг нет, то введите текстом</b>', {reply_markup: {inline_keyboard: but}});
+                return;
             }
         },
         async (ctx) => {
             if(ctx.callbackQuery){
-                if(ctx.callbackQuery.data === 'stopscene'){
+                if(ctx.callbackQuery.data === `stopscene`){
                     ctx.deleteMessage();
                     return await ctx.scene.leave();
                 }
+                else if(ctx.callbackQuery.data === `nottn`){
+                    ctx.deleteMessage();
+                    // Собираем строку all_dops для базы данных
+                    let all_dops = '';
+                    if(ctx.wizard.state.dop && ctx.wizard.state.dop.length > 0){
+                        all_dops = ctx.wizard.state.dop.map(d => `${d.name} x${d.count}`).join('\n');
+                    }
+                    for(const dop in ctx.wizard.state.dop_edit){
+                        all_dops += dop + '\n'
+                    }
+                    await db.addDriverFinishForm({
+                        form_id: ctx.wizard.state.form_id,
+                        created_by: ctx.from.id,
+                        amount: ctx.wizard.state.betonAmount,
+                        money_get: ctx.wizard.state.money.sum,
+                        money_type: ctx.wizard.state.money.type,
+                        dops: all_dops,
+                        ttn: '-',
+                        carname: (await db.getCarByDriver(ctx.from.id)).name || 'Неизвестная машина'
+                    })
+
+                    if(ctx.wizard.state.isLastTrip) {
+                        await db.updateForm(ctx.wizard.state.form_id, `status`, 3)
+                        const user = await db.getUser(ctx.from.id);
+                        if(user.zavod > -1){
+                            const zavod = await db.getZavod(user.zavod);
+                            if(zavod && zavod.group !== -1 && zavod.group !== null){
+                                ctx.telegram.sendMessage(zavod.group, `<b>${status[user.status]} ${user.real_name || `Неизвестное имя`} (TG: ${ctx.from.first_name} @${ctx.from.username})
+
+Действие:</b> Сделал закрывающий рейс на заявку #${ctx.wizard.state.form_id} на машина ${(await db.getCarByDriver(ctx.from.id)).name || 'Неизвестная машина'}`, {parse_mode:'HTML'})
+                            }
+                        }
+                    }
+                    ctx.replyWithHTML(`Спасибо за информацию по заявке! Ожидайте следующих или отработайте действующие заявки в разделе "мои заявки" –> "Завершенные"`)
+                    return ctx.scene.leave();
+                }
+                else if(ctx.callbackQuery.data === `stop`){
+                    ctx.deleteMessage();
+
+                    let media = [];
+                    let ph = [];
+                    let vd = [];
+                    if(ctx.wizard.state.photo !== undefined && ctx.wizard.state.photo?.length > 0){
+                        ph = ctx.wizard.state.photo.map((fileId) => {
+                        return {type: 'photo', fileId: fileId}});
+                    }
+                    if(ctx.wizard.state.video !== undefined && ctx.wizard.state.video?.length > 0){
+                        vd = ctx.wizard.state.video.map((fileId) => {return {type: 'video', fileId: fileId}});
+                    }
+                    media = JSON.stringify(media.concat(ph,vd));
+
+                    // Собираем строку all_dops для базы данных
+                    let all_dops = '';
+                    if(ctx.wizard.state.dop && ctx.wizard.state.dop.length > 0){
+                        all_dops = ctx.wizard.state.dop.map(d => `${d.name} x${d.count}`).join('\n');
+                    }
+                    for(const dop in ctx.wizard.state.dop_edit){
+                        all_dops += dop + '\n'
+                    }
+                    await db.addDriverFinishForm({
+                        form_id: ctx.wizard.state.form_id,
+                        created_by: ctx.from.id,
+                        amount: ctx.wizard.state.betonAmount,
+                        money_get: ctx.wizard.state.money.sum,
+                        money_type: ctx.wizard.state.money.type,
+                        dops: all_dops,
+                        ttn: media,
+                        carname: (await db.getCarByDriver(ctx.from.id)).name || 'Неизвестная машина'
+                    })
+
+                    if(ctx.wizard.state.isLastTrip) {
+                        await db.updateForm(ctx.wizard.state.form_id, `status`, 3)
+                        const user = await db.getUser(ctx.from.id);
+                        if(user.zavod > -1){
+                            const zavod = await db.getZavod(user.zavod);
+                            if(zavod && zavod.group !== -1 && zavod.group !== null){
+                                ctx.telegram.sendMessage(zavod.group, `<b>${status[user.status]} ${user.real_name || `Неизвестное имя`} (TG: ${ctx.from.first_name} @${ctx.from.username})
+
+Действие:</b> Сделал закрывающий рейс на заявку #${ctx.wizard.state.form_id} на машина ${(await db.getCarByDriver(ctx.from.id)).name || 'Неизвестная машина'}`, {parse_mode:'HTML'})
+                            }
+                        }
+                    }
+                    ctx.replyWithHTML(`Спасибо за информацию по заявке! 
+Ожидайте следующих  заявок в разделе "мои заявки " — "назначенные"  или привяжитесь к ней
+Завершенные вами заявки в разделе "мои заявки" –> "Завершенные"`)
+                    return ctx.scene.leave();
+                }
             }
             else if(ctx.message?.photo){
-                ctx.wizard.state.TTN = ctx.message?.photo[ctx.message.photo.length - 1]?.file_id || `-`;
-                ctx.deleteMessage();
-                ctx.deleteMessage(ctx.wizard.state.messageId);
-                let all_dops = ``;
-                for(const dop in ctx.wizard.state.dop){
-                    all_dops += dop + '\n'
-                }
-                for(const dop in ctx.wizard.state.dop_edit){
-                    all_dops += dop + '\n'
-                }
-
-                await db.addDriverFinishForm({
-                    form_id: ctx.wizard.state.form_id,
-                    created_by: ctx.from.id,
-                    amount: ctx.wizard.state.betonAmount,
-                    money_get: ctx.wizard.state.money.sum,
-                    money_type: ctx.wizard.state.money.type,
-                    dops: all_dops,
-                    ttn: ctx.wizard.state.TTN,
-                    carname: (await db.getCarByDriver(ctx.from.id)).name || 'Неизвестная машина'
-                })
-
-                if(ctx.wizard.state.isLastTrip) await db.updateForm(ctx.wizard.state.form_id, `status`, 3);
-                ctx.replyWithHTML(`Спасибо за информацию по заявке! Ожидайте следующих или отработайте действующие заявки в разделе "мои заявки" –> "Завершенные"`)
-                return ctx.scene.leave();
-
+                if(!ctx.wizard.state.photo) ctx.wizard.state.photo = [];
+                await ctx.deleteMessage(ctx.wizard.state.messageId)
+                await ctx.deleteMessage()
+                ctx.wizard.state.photo.push(ctx.message.photo[ctx.message.photo.length - 1].file_id);
+                const s = await ctx.replyWithHTML(`📷 <b>Добавлено фото!</b>`, {reply_markup: {inline_keyboard: [[{text: 'Закончить', callback_data: 'stop'}],[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
+                ctx.wizard.state.messageId = s.message_id;
+            }
+            else if(ctx.message?.video){
+                if(!ctx.wizard.state.video) ctx.wizard.state.video = [];
+                await ctx.deleteMessage(ctx.wizard.state.messageId)
+                await ctx.deleteMessage()
+                ctx.wizard.state.video.push(ctx.message.video.file_id);
+                const s = await ctx.replyWithHTML(`📷 <b>Добавлено видео!</b>`, {reply_markup: {inline_keyboard: [[{text: 'Закончить', callback_data: 'stop'}],[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
+                ctx.wizard.state.messageId = s.message_id;
+            }
+            else{
+                await ctx.deleteMessage(ctx.wizard.state.messageId)
+                await ctx.deleteMessage()
+                const s = await ctx.replyWithHTML(`❌ <b>Требуется прислать фото/видео!</b>`, {reply_markup: {inline_keyboard: [[{text: 'Продолжить без ттн', callback_data: 'nottn'}],[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
+                ctx.wizard.state.messageId = s.message_id;
+                return
             }
         }
     );
 
-    const attachToForm = new Scenes.WizardScene(
+    const create_group = new Scenes.WizardScene(
+        'create_group',
+        async (ctx) => {
+            const s = await ctx.reply('📌 Для создания новой группы:\n1. Создайте группу в Telegram (Или возьмите существующую)\n2. Добавьте меня в неё как администратора\n3. Отправьте сюда чат ID этой группы.');
+            ctx.wizard.state.messageId = s.message_id;
+            return ctx.wizard.next();
+        },
+        async (ctx) => {
+            console.log(ctx.message)
+            let chatId = Number(ctx.message?.text);
+            if(isNaN(chatId)){return await ctx.reply('❌ Это не группа/супергруппа. Создайте группу сначала.');}
+
+            const botMember = await ctx.telegram.getChatMember(chatId, ctx.botInfo.id);
+            if (!['administrator', 'creator'].includes(botMember.status)) {
+                await ctx.reply('❌ Я должен быть администратором в группе!');
+                return ctx.scene.leave();
+            }
+
+            await db.updateZavod((await db.getUser(ctx.from.id)).zavod, 'group', chatId)
+            await ctx.replyWithHTML(`<b>Обнаружена группа\nТеперь я буду отправлять логи в эту группу.</b>`);
+            return ctx.scene.leave();
+        }
+      );
+
+
+
+    const attachToForm = createErrorHandledScene(
         `attachToForm`,
         async (ctx) => {
             const s = await ctx.replyWithHTML(`<b>Введите номер заявки к которой нужно привязаться</b>`, {reply_markup: {inline_keyboard: [[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
@@ -2688,13 +3518,28 @@ module.exports.setupScenes = () => {
             }
             else if(ctx.message?.text){
                 try{
-                    const form = await db.getForm(parseInt(ctx.message.text));
+                    const form = await db.getForm(Number(ctx.message.text) > 0 ? Number(ctx.message.text) : -1);
                     if(form){
                         const car = await db.getCarByDriver(ctx.from.id);
                         if(car){
                             ctx.scene.leave()
-                            const res = await db.addCarToForm(form.fid, car.fid, car.name, 1, 0);
+                            await db.addCarToForm(form.fid, car.fid, car.name, 1, 0);
                             ctx.replyWithHTML(`<b>Вы успешно привязаны к заявке!</b>`)
+                            index.openAncet(ctx, form.fid, 1)
+                            const user = await db.getUser(ctx.from.id)
+
+                            if(form.status === 1){
+                                db.updateForm(form.fid, '`status`', 2)
+                            }
+
+                            if(form.logist_id !== -1){
+                                ctx.telegram.sendMessage(form.logist_id, `<b>${status[user?.status || 3]} ${user?.real_name || `имя не указано`} машины ${car?.name || `машина не найдена`} привязался к заявке #${form.fid}
+Заявка находится в разделе "список заявок"</b>`, {parse_mode: 'HTML'})
+                            }
+                        }
+                        else{
+                            await ctx.replyWithHTML(`<b>Ваша машина не найдена! Ошибка.</b>`);
+                            return ctx.scene.leave()
                         }
                     }
                     else{
@@ -2703,6 +3548,7 @@ module.exports.setupScenes = () => {
                     }
                 }
                 catch(er){
+                    console.log(er)
                     const s = await ctx.replyWithHTML(`<b>Заявка не найдена! Введите еще раз.</b>`, {reply_markup: {inline_keyboard: [[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
                     ctx.wizard.state.messageId = s.message_id;
                 }
@@ -2951,6 +3797,7 @@ module.exports.setupScenes = () => {
                     ctx.wizard.state.betonType = parseInt(ctx.callbackQuery.data.split('_')[1]);
                     const s = await ctx.replyWithHTML(`⚖️ <b>Укажите объем/цену за кубометр со скидкой 
 ❗️Если цена по прайсу, напишите только объем❗️
+Выбранная вами марка: ${await db.getBetonName(ctx.wizard.state.betonType)}
 
 (Пример 10/7000)</b>`, {reply_markup: {inline_keyboard: [[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
                     ctx.wizard.state.messageId = s.message_id;
@@ -2987,11 +3834,41 @@ module.exports.setupScenes = () => {
                     return;
                 }
             }
+            const s = await ctx.replyWithHTML(`👤 <b>Укажите физ/юр лицо заявки</b>`, {reply_markup: {inline_keyboard: [[{text: 'Физ. лицо', callback_data: 'entity:0'}],[{text: 'Юр. лицо', callback_data: 'entity:1'}],[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
+            ctx.wizard.state.messageId = s.message_id;
+            return ctx.wizard.next();
+        },
+        async (ctx) => {
+            if(ctx.callbackQuery){
+                if(ctx.callbackQuery.data === `stopscene`){
+                    ctx.deleteMessage();
+                    return await ctx.scene.leave();
+                }
+                else if(ctx.callbackQuery.data.startsWith(`entity:`)){
+                    await ctx.deleteMessage();
+                    ctx.wizard.state.entity = {type: parseInt(ctx.callbackQuery.data.split(':')[1])};
+                    const s = await ctx.replyWithHTML(`👤 <b>Если физ лицо, впишите имя клиента, при юр. лице вписывайте название компании.</b>`, {reply_markup: {inline_keyboard: [[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
+                    ctx.wizard.state.messageId = s.message_id;
+                    return ctx.wizard.next();
+                }
+            }
+        },
+        async (ctx) => {
+            if(ctx.callbackQuery){
+                if(ctx.callbackQuery.data === `stopscene`){
+                    ctx.deleteMessage();
+                    return await ctx.scene.leave();
+                }
+            }
+            await ctx.deleteMessage(ctx.wizard.state.messageId)
+            await ctx.deleteMessage();
+            ctx.wizard.state.entity.text = ctx.message.text
             const s = await ctx.replyWithHTML(`<b>Дата: ${ctx.wizard.state.date} | ${ctx.wizard.state.timeInterval}
 Обьем: ${ctx.wizard.state.amount} м³
 Марка: ${(await query(`SELECT * FROM nc WHERE fid=?`,[ctx.wizard.state.betonType]))[0].name}
 Цена: ${ctx.wizard.state.userPrice} руб/м³
-Общая стоимость: ${ctx.wizard.state.amount * ctx.wizard.state.userPrice} руб</b>`, {reply_markup: {inline_keyboard: [[{text: 'Создать', callback_data: 'create'}],[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
+Общая стоимость: ${ctx.wizard.state.amount * ctx.wizard.state.userPrice} руб</b>
+${entity[ctx.wizard.state.entity.type]}: ${ctx.message.text}`, {reply_markup: {inline_keyboard: [[{text: 'Создать', callback_data: 'create'}],[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
             ctx.wizard.state.messageId = s.message_id;
             return ctx.wizard.next();
         },
@@ -3017,18 +3894,86 @@ module.exports.setupScenes = () => {
                         betonPrice: parseInt(s.price),
                         zavod: -2,
                         status: 5,
+                        entity: s.entity.type,
+                        entity_text: s.entity.text,
                         pickup: user.zavod,
                         isPickup: 1
                     })
                     if(res){
                         ctx.replyWithHTML(`<b>Самовывоз успешно создан под номером #${res}. Он будет отображаться в: "🚛 Самовывоз"</b>`)
+                    
+                        const user = await db.getUser(ctx.from.id);
+                        if(user.zavod > -1){
+                            const zavod = await db.getZavod(user.zavod);
+                            if(zavod && zavod.group !== -1){
+                                ctx.telegram.sendMessage(zavod.group, `<b>${status[user.status]} ${user.real_name || `Неизвестное имя`} (TG: ${ctx.from.first_name} @${ctx.from.username})
+    
+Действие:</b> Создал самовывоз под номером #${ctx.wizard.state.fid}, дата: ${s.date} | ${s.timeInterval}, обьем: ${s.amount} м³ ${betont}`, {parse_mode:'HTML'})
+                            }
+                        }
                     }
                 }
             }
         }
     )
 
-    return [enter_name,enter_company, create_pickup_form,create_ancet, search_by_id, search_by_phone, load_nc, driver_registration,worker_registration, add_car, manager_create, editmedia_form, edit_form, manager_shet,  search_ancet, booking_own_car, add_car_carrier, booking_own_car_carrier, offer_conditions, finish_form, attachToForm];
+    const get_ttn_by_form = new Scenes.WizardScene(
+        `get_ttn_by_form`,
+        async (ctx) => {
+            const s = await ctx.replyWithHTML(`<b>Введите номер заявки к которой нужно привязаться</b>`, {reply_markup: {inline_keyboard: [[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
+            ctx.wizard.state.messageId = s.message_id;
+            return ctx.wizard.next();
+        },
+        async (ctx) => {
+            if(ctx.callbackQuery){
+                if(ctx.callbackQuery.data === 'stopscene'){
+                    ctx.deleteMessage();
+                    return await ctx.scene.leave();
+                }
+            }
+            else if(ctx.message?.text){
+                try{
+                    const form = await db.getForm(parseInt(ctx.message.text));
+                    if(form){
+                        ctx.deleteMessage();
+                        ctx.deleteMessage(ctx.wizard.state.messageId);
+                        ctx.scene.leave();
+                        const driver_forms = await db.getDriverFormsByFormId(form.fid);
+                        let mediaArray = []
+                        for(const driver_form of driver_forms){
+                            mediaArray = [...mediaArray, ...(driver_form.ttn !== '-' ? JSON.parse(driver_form.ttn) : [])]
+                        }
+
+                        try {
+                            if (mediaArray.length === 0) {
+                                return ctx.reply('❌ Медиафайлы отсутствуют.', {show_alert: true});
+                            }
+                            const mediaGroup = mediaArray.map(item => ({
+                                type: item.type,
+                                media: item.fileId
+                            }));
+                
+                            await ctx.replyWithMediaGroup(mediaGroup);
+                        } catch (error) {
+                            console.error('Ошибка при отправке медиафайлов:', error);
+                            ctx.reply('Произошла ошибка при отправке медиафайлов.');
+                        }
+                    }
+                    else{
+                        const s = await ctx.replyWithHTML(`<b>Заявка не найдена! Введите еще раз.</b>`, {reply_markup: {inline_keyboard: [[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
+                        ctx.wizard.state.messageId = s.message_id;
+                    }
+                }
+                catch(er){
+                    console.log(er)
+                    const s = await ctx.replyWithHTML(`<b>Заявка не найдена! Введите еще раз.</b>`, {reply_markup: {inline_keyboard: [[{text: '❌ Отмена', callback_data: 'stopscene'}]]}});
+                    ctx.wizard.state.messageId = s.message_id;
+                }
+            }
+        },
+    )
+
+    return [create_group,enter_name,enter_company, create_zavod, create_pickup_form,create_ancet, search_by_id, search_by_phone, load_nc, driver_registration,worker_registration, add_car, manager_create, editmedia_form, edit_form, manager_shet,  search_ancet, booking_own_car, add_car_carrier, booking_own_car_carrier, offer_conditions, finish_form, attachToForm, get_ttn_by_form];
 };
 
 async function resultPrice(ctx) {
@@ -3042,8 +3987,8 @@ async function resultPrice(ctx) {
     if(ctx.wizard.state.dop && ctx.wizard.state.dop.length > 0){
         if(!ctx.wizard.state.dop) {ctx.wizard.state.dop = []}
     for(const dop of ctx.wizard.state.dop){
-        dops += `\n• ${dop.name} - ${dop.price_per_unit} руб.`
-        price_dop += dop.price_per_unit;
+        dops += `\n• ${dop.name} — <b>${dop.count}</b> ${dop.unit_of_measurement || ''}`
+        price_dop += dop.price_per_unit * dop.count;
     }
     }
 
@@ -3074,8 +4019,8 @@ async function exitPrice(ctx) {
     let price_dop = 0
     if(!ctx.wizard.state.dop) {ctx.wizard.state.dop = []}
     for(const dop of ctx.wizard.state.dop){
-        dops += `\n• ${dop.name} - ${dop.price_per_unit} руб.`
-        price_dop += dop.price_per_unit;
+        dops += `\n• ${dop.name} — <b>${dop.count}</b> ${dop.unit_of_measurement || ''}`
+        price_dop += dop.price_per_unit * dop.count;
     }
 
     let enterPrice = betonPrice + deliveryPrice + price_dop;
@@ -3101,8 +4046,8 @@ async function last(ctx) {
     let dops = ``;
     let price_dop = 0
     for(const dop of st.dop){
-        dops += `\n• ${dop.name} - ${dop.price_per_unit} руб.`
-        price_dop += dop.price_per_unit;
+        dops += `\n• ${dop.name} — <b>${dop.count}</b> ${dop.unit_of_measurement || ''}`
+        price_dop += dop.price_per_unit * dop.count;
     }
     let f;
     if(st.payForm === 2){

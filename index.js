@@ -26,23 +26,27 @@ async function clientRegistration(ctx, ref=-1){
                 ]}})
     }
 }
-async function workerRegistration(ctx,st, from, zavod){
+async function workerRegistration(ctx,st, from, zavod, created = 0){
     let user = await getUser(ctx.from.id);
-    if(user){
+    if(user && created === 0){
         mainMenu(ctx, user.status);
     }
     else{
-        await insertUser(ctx, ctx.from, '-', st,0,zavod);
-        return ctx.scene.enter(`worker_registration`, {from: from})
+        if(created === 0){
+            await insertUser(ctx, ctx.from, '-', st,0,zavod);
+        }
+        return ctx.scene.enter(`worker_registration`, {from: from, status: st, creater_zavod: zavod})
     }
 }
-async function driverRegistration(ctx, from){
+async function driverRegistration(ctx, from, created=0){
     let user = await getUser(ctx.from.id);
-    if(user){
+    if(user && created === 0){
         mainMenu(ctx, user.status);
     }
     else{
-        await insertUser(ctx, ctx.from, '-', 7,0, -1);
+        if(created === 0){
+            await insertUser(ctx, ctx.from, '-', 7,0, -1);
+        }
         return ctx.scene.enter(`driver_registration`, {from: from})
     }
 }
@@ -95,7 +99,7 @@ async function getWorker(ctx, id,reply=1){
             ctx.replyWithHTML(text, {reply_markup: {inline_keyboard: [[{text:'Удалить сотрудника', callback_data: `delworker:${user.id}`}],[{text:'Вернуться', callback_data: 'workers'}]]}})
         }
         else if(reply === 0){
-            ctx.editMessageText(text, {parse_mode: 'HTML',reply_markup: {inline_keyboard: [[{text:'Удалить сотрудника', callback_data: `delworker:${user.id}`}],[{text:'Вернуться', callback_data: 'workers'}]]}})
+            ctx.editMessageText(text, {parse_mode: 'HTML',reply_markup: {inline_keyboard: [[{text:'Удалить сотрудника', callback_data: `delworker:${user.id}`}],[{text:'Вернуться', callback_data: `workers`}]]}})
         }
     }
     else{
@@ -103,15 +107,31 @@ async function getWorker(ctx, id,reply=1){
     }
 }
 module.exports.allWorkers = async (ctx, reply=1) => {
-    let but = [];
-    let all = await query(`SELECT * FROM users WHERE status!=0 AND status!=5 AND zavod=?`, [ctx.res.zavod]);
-    all.forEach((item) => {
-        but.push([{text: `${item.real_name || 'Не ввел имя'} | ${status[item.status]}`, callback_data: `getworker:${item.id}`}]);
-    })
+
+    const zavod = await db.getZavod(ctx.res.zavod);
+    let groupExists = zavod && zavod.group !== -1 && zavod.group !== null;
+    let keyboard = [];
+    if (!groupExists) {
+        keyboard.push([{text: 'Создать группу', url: `https://t.me/${ctx.botInfo.username}?startgroup=true`}]);
+    } else {
+        keyboard.push([{text: `Группа: ${zavod.group}`, callback_data: 'delete_group:' + ctx.res.zavod}]);
+    }
+    let but = keyboard;
+    // let all = await query(`SELECT * FROM users WHERE status!=0 AND status!=5 AND zavod=?`, [ctx.res.zavod]);
+    // all.forEach((item) => {
+    //     but.push([{text: `${item.real_name || 'Не ввел имя'} | ${status[item.status]}`, callback_data: `getworker:${item.id}`}]);
+    // })
+    but.push([{text: 'Менеджеры', callback_data: 'get_workers:1'}],
+        [{text: 'Логисты', callback_data: 'get_workers:2'}],
+        [{text: 'Водители', callback_data: 'get_workers:3'}],
+        [{text: 'Бухгалтеры', callback_data: 'get_workers:4'}],
+        [{text: 'Перевозчики', callback_data: 'get_workers:6'}])
     but.push([{text: 'Добавить сотрудника', callback_data: 'add_worker'}]);
     but.push([{text: 'Закрыть окно', callback_data: 'delmsg'}]);
     if(reply === 1){
-        ctx.replyWithHTML(`👔 <b>Все ваши работники на данный момент</b>`, {reply_markup: {inline_keyboard: but}})
+        ctx.replyWithHTML(`👔 <b>Все ваши работники на данный момент</b>
+
+<i>При нажатии на группу, она удаляется</i>`, {reply_markup: {inline_keyboard: but}})
     }
     else{
         ctx.editMessageText(`👔 <b>Все ваши работники на данный момент</b>`, {parse_mode: 'HTML',reply_markup: {inline_keyboard: but}})
@@ -145,23 +165,65 @@ module.exports.allCars = async (ctx, reply=1)=>{
 }
 
 const {userAncets, allWorkers, allCars, generateRandomString} = require(`./index`);
+const { inlineKeyboard } = require('telegraf/markup');
 
 const stage = new Scenes.Stage(setupScenes());
 bot.use(session());
 bot.use(stage.middleware());
+bot.on(`message`, async (ctx, next)=>{
+    if (ctx.message.new_chat_members?.some(user => user.id === ctx.botInfo.id)) {
+        const chatId = ctx.chat.id;
+        if ((await db.getUser(ctx.from.id))?.status !== 5) {
+            ctx.reply(
+                '❌ Бота может добавлять только администратор. Бот покидает чат.',
+                { reply_to_message_id: ctx.message.message_id }
+            );
+            await ctx.leaveChat();
+        }
 
+        await db.updateZavod((await db.getUser(ctx.from.id)).zavod, 'group', chatId)
+        await ctx.replyWithHTML(`<b>Обнаружена группа\nТеперь я буду отправлять логи в эту группу.</b>`);
+    }
+    else{
+        return next()
+    }
+})
 bot.use(async (ctx,next)=>{
+    if (ctx.chat.id !== ctx.from.id) return;
     if (ctx.from && ctx.from.id === ctx.botInfo.id) {
         return;
-    }
-    if(!ctx.from.username){
-        return ctx.replyWithHTML(`❌ <b>У вас нет Username в профиле! Пожалуйста, добавьте его в профиль и попробуйте снова.</b>`)
     }
     if(ctx.message?.text?.startsWith(`/start`)){
         let res = await getUser(ctx.from.id);
         if(res){
-            mainMenu(ctx, res.status);
-            await query(`UPDATE users SET username=?, name=? WHERE id=?`, [ctx.from.username, ctx.from.first_name, ctx.from.id])
+            let ref = ctx.message.text.split(' ')[1];
+            if(ref){
+                let link = await query(`SELECT * FROM links WHERE hash=?`, [ref]);
+                if(link.length > 0){
+                    link = link[0];
+                    if(link.do.startsWith(`add:`)){
+                        let add_status = parseInt(link.do.split(':')[1])
+                        await workerRegistration(ctx,add_status, link.from, link.zavod, 1);
+                        await query(`DELETE FROM links WHERE fid=?`, [link.fid]);
+                    }
+                    else if(link.do === `ref`){
+                        await clientRegistration(ctx,link.zavod);
+                        await query(`DELETE FROM links WHERE fid=?`, [link.fid]);
+                    }
+                    else if(link.do === `addliverydriver`){
+                        await driverRegistration(ctx,link.from, 1);
+                        await query(`DELETE FROM links WHERE fid=?`, [link.fid]);
+                    }
+                }
+                else{
+                    mainMenu(ctx, res.status);
+                    await query(`UPDATE users SET username=?, name=? WHERE id=?`, [ctx.from.username, ctx.from.first_name, ctx.from.id])
+                }
+            }
+            else{
+                mainMenu(ctx, res.status);
+                await query(`UPDATE users SET username=?, name=? WHERE id=?`, [ctx.from.username, ctx.from.first_name, ctx.from.id])
+            }
         }
         else{
             let ref = ctx.message.text.split(' ')[1];
@@ -202,9 +264,13 @@ bot.use(async (ctx,next)=>{
     }
 })
 
+async function userOffers(ctx) {
+    const offers = await db.getZavodOffersForUser(ctx.from.id);
+    let but = offers.map(s=> { return [{text: `Предложение к заявке #${s.fid}`, callback_data: `getanc:${s.fid}`}] })
+    await ctx.replyWithHTML(`<b>🗂 Мои предложения</b>`, {parse_mode: 'HTML', reply_markup: {inline_keyboard: but}})
+}
 
-
-module.exports.openAncet = async (ctx,id, reply=1)=>{
+module.exports.openAncet = async (ctx,id, reply=1, chatId=null)=>{
     const anc = (await query(`SELECT * FROM forms WHERE fid=?`, [id]))[0]
 
     if(!anc){
@@ -225,32 +291,36 @@ module.exports.openAncet = async (ctx,id, reply=1)=>{
                 namesOnly = anc.dopAll.split('\n').map(line => removePriceFromDops(line)).join('\n');
             }
             text = `<b>📋 Заявка #${anc.fid}
-1. Статус заявки:</b> ${ancetaStatus[anc.status]}
-<b>2. Дата и время:</b> ${anc.date}
-<b>3. Адрес:</b> ${anc.place}
-<b>4. Номер телефона:</b> ${anc.phone}
-<b>5. Бетон:</b> ${anc.betonType} - ${anc.betonAmount} м³
-<b>6. Форма оплаты:</b> ${anc.payForm}
-<b>7. Допы:</b> ${namesOnly}
-<b>8. Стоимость выход:</b> ${anc.exitPrice === -1 ? 'Не расчитана' : anc.exitPrice + ' руб.'}
-<b>9. Комментарий:</b> ${anc.com}
-<b>10. Менеджер:</b> ${anc.real_name}`
+• Статус заявки:</b> ${ancetaStatus[anc.status]}
+<b>• Дата и время:</b> ${anc.date}
+<b>• Адрес:</b> ${anc.place}${anc.entity_text === null || anc.entity_text === undefined ? '' : `\n<b>• ${anc.entity === 0 ? 'Имя' : 'Организация'}:</b> ${anc.entity_text}`}
+<b>• Номер телефона:</b> ${anc.phone}
+<b>• Бетон:</b> ${anc.betonType} - ${anc.betonAmount} м³
+<b>• Форма оплаты:</b> ${anc.payForm}
+<b>• Допы:</b> ${namesOnly}
+<b>• Стоимость выход:</b> ${anc.exitPrice === -1 ? 'Не расчитана' : anc.exitPrice + ' руб.'}
+<b>• Комментарий:</b> ${anc.com}
+<b>• Менеджер:</b> ${anc.real_name}`
             but.push([{text: 'Открыть фото', callback_data: `get_form_media:${anc.fid}`}])
+            but.push([{text: 'Добавить фото/видео', callback_data: `form_add_media:${anc.fid}`}])
+            if(anc.type === 2){
+                but.push([{text: 'Принять предложение', callback_data: `accept_offer_client:${anc.fid}`}])
+            }
+            
         }
         else if(user.status === 1){
             text = `<b>📋 Заявка #${anc.fid}
-1. Статус заявки:</b> ${ancetaStatus[anc.status]}
-<b>2. Дата и время:</b> ${anc.date}
-<b>3. Адрес:</b> ${anc.place}
-<b>4. Номер телефона:</b> ${anc.phone}
-<b>5. Бетон:</b> ${anc.betonType} - ${anc.betonAmount} м³ * ${anc.betonUserPrice} (Прайс: ${anc.betonPrice})
-<b>6. Форма оплаты:</b> ${anc.payForm}
-<b>7. Доставка:</b> ${anc.deliveryPriceWithAdd}₽ за ${anc.deliveryAmount} (Прайс: ${anc.deliveryPrice}₽)
-<b>8. Допы (${anc.dopPrice}):</b> ${anc.dopAll}
-<b>9. Стоимость вход:</b> ${anc.enterPrice} руб.
-<b>10. Стоимость выход:</b> ${anc.exitPrice} руб.
-<b>11. Комментарий:</b> ${anc.com}
-<b>12. Менеджер:</b> ${anc.real_name}`
+• Статус заявки:</b> ${ancetaStatus[anc.status]}
+<b>• Дата и время:</b> ${anc.date}
+<b>• Адрес:</b> <code>${anc.place}</code> (Нажмите на адрес чтобы скопировать)${anc.entity_text === null || anc.entity_text === undefined ? '' : `\n<b>• ${anc.entity === 0 ? 'Имя' : 'Организация'}:</b> ${anc.entity_text}`}${anc.type === 1 ? `\n<b>• Номер телефона:</b> ${anc.phone}` : ''}
+<b>• Бетон:</b> ${anc.betonType} - ${anc.betonAmount} м³ * ${anc.betonUserPrice} (Прайс: ${anc.betonPrice})
+<b>• Форма оплаты:</b> ${anc.payForm}
+<b>• Доставка:</b> ${anc.deliveryPriceWithAdd}₽ за ${anc.deliveryAmount} (Прайс: ${anc.deliveryPrice}₽)
+<b>• Допы (${anc.dopPrice}):</b> ${anc.dopAll}
+<b>• Стоимость вход:</b> ${anc.enterPrice} руб.
+<b>• Стоимость выход:</b> ${anc.exitPrice} руб.
+<b>• Комментарий:</b> ${anc.com}
+<b>• Менеджер:</b> ${anc.real_name}`
             but.push([{text: 'Открыть фото', callback_data: `get_form_media:${anc.fid}`}])
             if((anc.type === 1 || anc.type === 2) && anc.status !== 3 && anc.status !== 4){
                 if(user.zavod === anc.zavod){
@@ -274,21 +344,21 @@ module.exports.openAncet = async (ctx,id, reply=1)=>{
             if((anc.type === 1 || anc.type === 2 || anc.type === 3) && anc.status !== 3 && anc.status !== 4){
                 if(user.zavod === anc.zavod){
                     text = `<b>📋 Заявка #${anc.fid}
-1. Статус заявки:</b> ${ancetaStatus[anc.status]}
-<b>2. Дата и время:</b> ${anc.date}
-<b>3. Адрес:</b> ${anc.place}
-<b>4. Номер телефона:</b> ${anc.phone}
-<b>5. Бетон:</b> ${anc.betonType} - ${anc.betonAmount} м³ * ${anc.betonUserPrice} (Прайс: ${anc.betonPrice})
-<b>6. Форма оплаты:</b> ${anc.payForm}
-<b>7. Доставка:</b> ${anc.deliveryPriceWithAdd}₽ за ${anc.deliveryAmount} (Прайс: ${anc.deliveryPrice}₽)
-<b>8. Допы (${anc.dopPrice}):</b> ${anc.dopAll}
-<b>9. Стоимость вход:</b> ${anc.enterPrice} руб.
-<b>10. Стоимость выход:</b> ${anc.exitPrice} руб.
-<b>11. Комментарий:</b> ${anc.com}
-<b>12. Тип авто:</b> 
+• Статус заявки:</b> ${ancetaStatus[anc.status]}
+<b>• Дата и время:</b> ${anc.date}
+<b>• Адрес:</b> <code>${anc.place}</code> (Нажмите на адрес чтобы скопировать)${anc.entity_text === null || anc.entity_text === undefined ? '' : `\n<b>• ${anc.entity === 0 ? 'Имя' : 'Организация'}:</b> ${anc.entity_text}`}
+<b>• Номер телефона:</b> ${anc.phone}
+<b>• Бетон:</b> ${anc.betonType} - ${anc.betonAmount} м³ * ${anc.betonUserPrice} (Прайс: ${anc.betonPrice})
+<b>• Форма оплаты:</b> ${anc.payForm}
+<b>• Доставка:</b> ${anc.deliveryPriceWithAdd}₽ за ${anc.deliveryAmount} (Прайс: ${anc.deliveryPrice}₽)
+<b>• Допы (${anc.dopPrice}):</b> ${anc.dopAll}
+<b>• Стоимость вход:</b> ${anc.enterPrice} руб.
+<b>• Стоимость выход:</b> ${anc.exitPrice} руб.
+<b>• Комментарий:</b> ${anc.com}
+<b>• Тип авто:</b> 
 ${car_types_text}
-<b>13. Кол-во машин:</b> ${anc.car_count === 0 ? 'Не указано' : anc.car_count}
-<b>14. Стоимость доставки для перевозчика:</b> ${anc.carrier_price === 0 ? 'Не указано' : anc.carrier_price + ' руб.'}`
+<b>• Кол-во машин:</b> ${anc.car_count === 0 ? 'Не указано' : anc.car_count}
+<b>• Стоимость доставки для перевозчика:</b> ${anc.carrier_price === 0 ? 'Не указано' : anc.carrier_price + ' руб.'}`
                     if(anc.status === 2){
                         if(anc.pickup === -2){
                             but.push([{text: 'Грузить с другого завода', callback_data: `form_shipment:${anc.fid}`}])
@@ -299,20 +369,20 @@ ${car_types_text}
                             [{text: 'Отправить конкретному перевозчику', callback_data: `get_all_carriers:${anc.fid}`}],
                             [{text: 'Забронировать своим транспортом', callback_data: `booking_own_car:${anc.fid}`}],
                             [{text: 'Перенести заявку', callback_data: `form_edit:${anc.fid}:0`},{text: 'Изменить объем', callback_data: `form_edit:${anc.fid}:1`}],
-                            [{text: 'Изменить стоимость доставки', callback_data: `form_edit:${anc.fid}:3`}],
+                            [{text: 'Изменить стоимость доставки', callback_data: `form_edit:${anc.fid}:4`}],
                             [{text: 'Уточнение по заявке менеджеру', url: `t.me/${await getUsernameByID(anc.created_by)}`}])
                     }
                 else if(anc.pickup === -1 || anc.pickup === user.zavod){
                     text = `<b>📋 Заявка #${anc.fid}
-1. Статус заявки:</b> Самовывоз
-<b>2. Дата и время:</b> ${anc.date}
-<b>3. Адрес:</b> ${anc.place}
-<b>5. Бетон:</b> ${anc.betonType} - ${anc.betonAmount} м³ * ${anc.betonUserPrice} (Прайс: ${anc.betonPrice})
-<b>6. Общая стоимость:</b> ${anc.betonAmount*anc.betonUserPrice}
-<b>7. Тип авто:</b> 
+• Статус заявки:</b> Самовывоз
+<b>• Дата и время:</b> ${anc.date}
+<b>• Адрес:</b> <code>${anc.place}</code> (Нажмите на адрес чтобы скопировать)
+<b>• Бетон:</b> ${anc.betonType} - ${anc.betonAmount} м³ * ${anc.betonUserPrice} (Прайс: ${anc.betonPrice})
+<b>• Общая стоимость:</b> ${anc.betonAmount*anc.betonUserPrice}
+<b>• Тип авто:</b> 
 ${car_types_text}
-<b>8. Кол-во машин:</b> ${anc.car_count === 0 ? 'Не указано' : anc.car_count}
-<b>9. Завод:</b> ${anc.zavod !== -2 ? await db.getZavodName(anc.zavod) : await db.getZavodName(anc.pickup)}`
+<b>• Кол-во машин:</b> ${anc.car_count === 0 ? 'Не указано' : anc.car_count}
+<b>• Завод:</b> ${anc.zavod !== -2 ? await db.getZavodName(anc.zavod) : await db.getZavodName(anc.pickup)}${anc.entity_text === null || anc.entity_text === undefined ? '' : `\n<b>• Организация:</b> ${anc.entity_text}`}`
                     if(anc.isPickup === 0){
                         let but2 = [{text: 'Подтвердить', callback_data: `acceptpickupform:${anc.fid}`}]
                         if(anc.pickup !== -1){
@@ -326,7 +396,7 @@ ${car_types_text}
                 }
             }
         }
-        else if(user.status === 3){
+        else if(user.status === 3 || user.status === 7){
             let car_types = await db.getCarTypesByForm(anc.fid);
             let car_types_text;
             if(car_types.length > 0){
@@ -343,17 +413,17 @@ ${car_types_text}
                 namesOnly = anc.dopAll.split('\n').map(line => removePriceFromDops(line)).join('\n');
             }
             text = `<b>📋 Заявка #${anc.fid}
-1. Статус заявки:</b> ${ancetaStatus[anc.status]}
-<b>2. Дата и время:</b> ${anc.date}
-<b>3. Адрес:</b> ${anc.place}
-<b>6. Доставка:</b> ${anc.deliveryPriceWithAdd}₽
-<b>7. Комментарий:</b> ${anc.com}
-<b>8. Допы:</b> ${namesOnly}
-<b>9. Тип авто:</b> 
+• Статус заявки:</b> ${ancetaStatus[anc.status]}
+<b>• Дата и время:</b> ${anc.date}
+<b>• Адрес:</b> <code>${anc.place}</code> (Нажмите на адрес чтобы скопировать)${anc.status === 2 || anc.status === 1 ? `\n<b>• Номер телефона:</b> ${anc.phone}` : ''}
+<b>• Доставка:</b> ${anc.deliveryPriceWithAdd}₽
+<b>• Комментарий:</b> ${anc.com}
+<b>• Допы:</b> ${namesOnly}
+<b>• Тип авто:</b> 
 ${car_types_text}
-<b>10. Кол-во машин:</b> ${car_types.length === 0 ? 'Не указано' : anc.car_count}
-<b>11. Комментарий логиста:</b> ${anc.logist_com || 'Не указан'}
-<b>12. Завод:</b> ${await db.getZavodName(anc.zavod) || 'Не указан'}`
+<b>• Кол-во машин:</b> ${car_types.length === 0 ? 'Не указано' : anc.car_count}
+<b>• Комментарий логиста:</b> ${anc.logist_com || 'Не указан'}
+<b>• Завод:</b> ${await db.getZavodName(anc.zavod) || 'Не указан'}`
 
             if(anc.carrier_price > 0){
                 text += `\n<b>13. Стоимость доставки для перевозчика:</b> ${anc.carrier_price} руб.`
@@ -368,18 +438,18 @@ ${car_types_text}
         }
         else if(user.status === 4){
             text = `<b>📋 Заявка #${anc.fid}
-1. Статус заявки:</b> ${ancetaStatus[anc.status]}
-<b>2. Дата и время:</b> ${anc.date}
-<b>3. Адрес:</b> ${anc.place}
-<b>4. Номер телефона:</b> ${anc.phone}
-<b>5. Бетон:</b> ${anc.betonType} - ${anc.betonAmount} м³ * ${anc.betonUserPrice} (Прайс: ${anc.betonPrice})
-<b>6. Форма оплаты:</b> ${anc.payForm}
-<b>7. Доставка:</b> ${anc.deliveryPriceWithAdd}₽ за ${anc.deliveryAmount} (Прайс: ${anc.deliveryPrice}₽)
-<b>8. Допы (${anc.dopPrice}):</b> ${anc.dopAll}
-<b>9. Стоимость вход:</b> ${anc.enterPrice} руб.
-<b>10. Стоимость выход:</b> ${anc.exitPrice} руб.
-<b>11. Комментарий:</b> ${anc.com}
-<b>12. Менеджер:</b> ${anc.real_name}`
+• Статус заявки:</b> ${ancetaStatus[anc.status]}
+<b>• Дата и время:</b> ${anc.date}
+<b>• Адрес:</b> <code>${anc.place}</code> (Нажмите на адрес чтобы скопировать)${anc.entity_text === null || anc.entity_text === undefined ? '' : `\n<b>• ${anc.entity === 0 ? 'Имя' : 'Организация'}:</b> ${anc.entity_text}`}
+<b>• Номер телефона:</b> ${anc.phone}
+<b>• Бетон:</b> ${anc.betonType} - ${anc.betonAmount} м³ * ${anc.betonUserPrice} (Прайс: ${anc.betonPrice})
+<b>• Форма оплаты:</b> ${anc.payForm}
+<b>• Доставка:</b> ${anc.deliveryPriceWithAdd}₽ за ${anc.deliveryAmount} (Прайс: ${anc.deliveryPrice}₽)
+<b>• Допы (${anc.dopPrice}):</b> ${anc.dopAll}
+<b>• Стоимость вход:</b> ${anc.enterPrice} руб.
+<b>• Стоимость выход:</b> ${anc.exitPrice} руб.
+<b>• Комментарий:</b> ${anc.com}
+<b>• Менеджер:</b> ${anc.real_name}`
             but.push([{text: 'Открыть фото', callback_data: `get_form_media:${anc.fid}`}])
             if((anc.type === 1 || anc.type === 2) && anc.status === 3 && anc.UPD !== 1 && anc.status !== 4){
                 if(user.zavod === anc.zavod){
@@ -399,16 +469,16 @@ ${car_types_text}
             }
 
             text = `<b>📋 Заявка #${anc.fid}
-1. Статус заявки:</b> ${ancetaStatus[anc.status]}
-<b>2. Дата и время:</b> ${anc.date}
-<b>3. Адрес:</b> ${anc.place}
-<b>6. Доставка:</b> ${anc.deliveryPriceWithAdd}₽
-<b>7. Комментарий:</b> ${anc.com}
-<b>8. Тип авто:</b> 
+• Статус заявки:</b> ${ancetaStatus[anc.status]}
+<b>• Дата и время:</b> ${anc.date}
+<b>• Адрес:</b> <code>${anc.place}</code> (Нажмите на адрес чтобы скопировать)${anc.entity_text === null || anc.entity_text === undefined ? '' : `\n<b>• ${anc.entity === 0 ? 'Имя' : 'Организация'}:</b> ${anc.entity_text}`}
+<b>• Доставка:</b> ${anc.deliveryPriceWithAdd}₽
+<b>• Комментарий:</b> ${anc.com}
+<b>• Тип авто:</b> 
 ${car_types_text}
-<b>9. Кол-во машин:</b> ${car_types.length === 0 ? 'Не указано' : anc.car_count}
-<b>10. Комментарий логиста:</b> ${anc.logist_com || 'Не указан'}
-<b>11. Завод:</b> ${await db.getZavodName(anc.zavod) || 'Не указан'}`
+<b>• Кол-во машин:</b> ${car_types.length === 0 ? 'Не указано' : anc.car_count}
+<b>• Комментарий логиста:</b> ${anc.logist_com || 'Не указан'}
+<b>• Завод:</b> ${await db.getZavodName(anc.zavod) || 'Не указан'}`
 
             if(anc.carrier_price > 0){
                 text += `\n<b>12. Стоимость доставки для перевозчика:</b> ${anc.carrier_price} руб.`
@@ -432,10 +502,20 @@ ${car_types_text}
         }
 
         if(reply === 1){
-            ctx.replyWithHTML(text, {reply_markup: {inline_keyboard: but}})
+            if(chatId){
+                ctx.telegram.sendMessage(chatId, text, {parse_mode: 'HTML', reply_markup: {inline_keyboard: but}})
+            }
+            else{
+                ctx.replyWithHTML(text, {reply_markup: {inline_keyboard: but}})
+            }
         }
         else{
-            ctx.editMessageText(text, {parse_mode: 'HTML',reply_markup: {inline_keyboard: but}})
+            if(chatId){
+                ctx.telegram.editMessageText(chatId, ctx.message.message_id, 0, text, {parse_mode: 'HTML', reply_markup: {inline_keyboard: but}})
+            }
+            else{
+                ctx.editMessageText(text, {parse_mode: 'HTML',reply_markup: {inline_keyboard: but}})
+            }
         }
     }
     else{
@@ -451,13 +531,13 @@ module.exports.incomingAncets = async (ctx, reply=1) => {
         await ctx.editMessageText(`<b>📩 Входящие заявки</b>`, {parse_mode: 'HTML',reply_markup: {inline_keyboard: [[{text: 'Неотработанные', callback_data: 'incoming_neotr'}], [{text: 'отправлено КП', callback_data: 'incoming_kp'}]]}})
     }
 }
-
 require('./logist/handlers')(bot);
 require('./carrier/handlers')(bot);
 require('./driver/handlers')(bot);
 require('./livery_driver/handlers')(bot);
 require('./accountant/handlers')(bot);
-
+require('./owner/handlers')(bot);
+require('./manager/handlers')(bot);
 bot.on('text', async (ctx) => {
     const user = ctx.from;
     const text = ctx.message.text;
@@ -533,12 +613,15 @@ BHGbeton@gmail.com или телеграмм аккаунт @betonbotnomer1`)
     else if(text === `❗️ У МЕНЯ УЖЕ ЕСТЬ ЗАЯВКА`){
         return userAncets(ctx)
     }
+    else if(text === `🗂 Мои предложения`){
+        return userOffers(ctx);
+    }
     else if(ctx.res?.status === 5){
         if(text === `🗄 Загрузить номенклатуру`){
             return ctx.scene.enter(`load_nc`)
         }
         else if(text === `👔 Мои сотрудники`){
-            return await allWorkers(ctx)
+            return allWorkers(ctx, 1)
         }
         else if(text === `🚚 Мои машины и водители`){
             return await allCars(ctx)
@@ -546,7 +629,7 @@ BHGbeton@gmail.com или телеграмм аккаунт @betonbotnomer1`)
     }
     else if(ctx.res?.status === 1 || ctx.res?.status === 5){
         if(text === `✏️ Создать заявку`){
-            return ctx.scene.enter(`manager_create`)
+            return ctx.replyWithHTML(`✏️ Создать заявку`, {reply_markup: {inline_keyboard: [[{text: 'Создать заявку', callback_data: 'create_form_manager'}],[{text: 'Создать самовывоз', callback_data: 'create_form_pickup_manager'}], [{text: 'Мои постоянники', callback_data: 'manager_postoyaniki'}]]}})
         }
         else if(text === `📋 Мои заявки`){
             return this.managerAncets(ctx);
@@ -579,6 +662,9 @@ bot.on(`callback_query`, async (ctx)=>{
             return ctx.scene.enter(`enter_company`, {ref: ref});
         }
     }
+    else if(data === `create_group`){
+        ctx.scene.enter(`create_group`)
+    }
     else if(data.startsWith(`getanc:`)){
         return this.openAncet(ctx, parseInt(data.split(':')[1]), 0)
     }
@@ -587,6 +673,17 @@ bot.on(`callback_query`, async (ctx)=>{
     }
     else if(data.startsWith(`m_getanc:`)){
         return this.openAncet(ctx, parseInt(data.split(':')[1]), 0)
+    }
+    else if(data === `create_form_manager`){
+        await ctx.deleteMessage();
+        return ctx.scene.enter(`manager_create`)
+    }
+    else if(data === `create_form_pickup_manager`){
+        await ctx.deleteMessage();
+        return ctx.scene.enter(`create_pickup_form`)
+    }
+    else if(data === `manager_postoyaniki`){
+        await ctx.answerCbQuery();
     }
     else if(data.startsWith(`get_form_media:`)){
         let anc = (await query(`SELECT * FROM forms WHERE fid=${data.split(':')[1]}`))[0]
@@ -613,6 +710,13 @@ bot.on(`callback_query`, async (ctx)=>{
         let id = parseInt(data.split(':')[1])
         ctx.scene.enter(`editmedia_form`, {anceta: id})
     }
+    else if(data.startsWith(`accept_offer_client:`)){
+        const id = parseInt(data.split(':')[1]);
+        const form = await db.getForm(id);
+        await db.acceptOfferForClient(id)
+        ctx.editMessageText(`<b>Заявка принята! Она отображается в "❗️ У МЕНЯ УЖЕ ЕСТЬ ЗАЯВКА"</b>`, {parse_mode: 'HTML'});
+        ctx.telegram.sendMessage(form.created_by, `<b>Клиент принял ваше предложение к заявке #${id}.</b>`, {parse_mode: 'HTML'});
+    }
     else if(data.startsWith(`form_edit:`)){
         let c = data.split(':');
         if(c.length === 3){
@@ -625,7 +729,7 @@ bot.on(`callback_query`, async (ctx)=>{
                 [{text: 'Изменить дату', callback_data: `form_edit:${anc.fid}:0`},{text: 'Изменить объем', callback_data: `form_edit:${anc.fid}:1`}],
                 [{text: 'Изменить марку', callback_data: `form_edit:${anc.fid}:2`},{text: 'Изменить выход', callback_data: `form_edit:${anc.fid}:3`}],
                 [{text: 'Изменить допы', callback_data: `form_edit:${anc.fid}:4`},],
-                [{text: 'Вернуться', callback_data: `form_edit:${anc.fid}`},],
+                [{text: 'Вернуться', callback_data: `getanc:${anc.fid}`},],
             ]
             ctx.editMessageReplyMarkup({inline_keyboard: but})   
         }
@@ -652,13 +756,12 @@ bot.on(`callback_query`, async (ctx)=>{
     else if(data.startsWith(`incoming_neotr_go:`)){
         let anc = (await query(`SELECT * FROM forms WHERE fid=${data.split(':')[1]}`))[0]
         await ctx.editMessageText(`<b>📋 Заявка #${anc.fid}
-1. Статус заявки:</b> ${ancetaStatus[anc.status]}
-<b>2. Дата и время:</b> ${anc.date}
-<b>3. Марка и обьем:</b> ${anc.betonType} | ${anc.betonAmount} м³
-<b>4. Адрес:</b> ${anc.place}
-<b>5. Допы:</b> ${anc.dopAll}
-<b>6. Комментарий:</b> ${anc.com}
-<b>7. Номер телефона:</b> ${anc.phone}`, {parse_mode: 'HTML',reply_markup: {inline_keyboard: [[{text: 'Обсчитать', callback_data: `startManage:${anc.fid}`}],[{text: 'Открыть фото', callback_data: `get_form_media:${anc.fid}`}],[{text: 'Вернуться', callback_data: 'incoming_neotr'}]]}});
+• Статус заявки:</b> ${ancetaStatus[anc.status]}
+<b>• Дата и время:</b> ${anc.date}
+<b>• Марка и обьем:</b> ${anc.betonType} | ${anc.betonAmount} м³
+<b>• Адрес:</b> <code>${anc.place}</code> (Нажмите на адрес чтобы скопировать)
+<b>• Допы:</b> ${anc.dopAll}
+<b>• Комментарий:</b> ${anc.com}`, {parse_mode: 'HTML',reply_markup: {inline_keyboard: [[{text: 'Обсчитать', callback_data: `startManage:${anc.fid}`}],[{text: 'Открыть фото', callback_data: `get_form_media:${anc.fid}`}],[{text: 'Вернуться', callback_data: 'incoming_neotr'}]]}});
     }
     else if(data === `incoming`){
         return this.incomingAncets(ctx, 0);
@@ -705,6 +808,11 @@ bot.on(`callback_query`, async (ctx)=>{
             allWorkers(ctx,0)
         }
     }
+    else if(data.startsWith(`delete_group:`)){
+        let id = parseInt(data.split(':')[1]);
+        await query(`UPDATE zavod SET \`group\`=-1 WHERE fid=?`, [id])
+        allWorkers(ctx,0)
+    }
     else if(data === `create_link_manager`){
         ctx.deleteMessage();
         let hash = generateRandomString(18)
@@ -735,6 +843,16 @@ bot.on(`callback_query`, async (ctx)=>{
     else if(data.startsWith(`getworker:`)){
         await getWorker(ctx,parseInt(data.split(':')[1]), 0)
     }
+    else if(data.startsWith(`get_workers:`)){
+        const status = parseInt(data.split(':')[1])
+        let but = []
+        let all = await query(`SELECT * FROM users WHERE status=${status} AND zavod=?`, [ctx.res.zavod]);
+        all.forEach((item) => {
+            but.push([{text: `${item.real_name || 'Не ввел имя'} | ${status[item.status]}`, callback_data: `getworker:${item.id}`}]);
+        })
+        but.push([{text: 'Вернуться', callback_data: 'workers'}]);
+        ctx.editMessageReplyMarkup({inline_keyboard: but});
+    }
     else if(data.startsWith(`deletelink:`)){
         let id = parseInt(data.split(':')[1]);
         await query(`DELETE FROM links WHERE fid=?`, [id])
@@ -762,16 +880,18 @@ bot.on(`callback_query`, async (ctx)=>{
         ctx.deleteMessage();
     }
     else {
-        ctx.answerCbQuery();
+        ctx.replyWithHTML(`<b>Функция еще в доработке, напишите в поддержку</b>`, {reply_markup: {inline_keyboard: [[{text: 'Поддержка', url: 't.me/BHGSUPPORT'}]]}});
     }
 })
 
 
-
-bot.catch((err, ctx) => {
-    console.error(`Error for ${ctx.updateType}:`, err);
-    ctx.reply('Произошла ошибка при обработке вашего запроса.');
-});
+bot.catch(async (err, ctx) => {
+    console.error('Global error:', err);
+    if (ctx.scene.current) {
+      await ctx.reply('Произошла ошибка, выхожу из сцены...');
+      await ctx.scene.leave();
+    }
+  });
 
 bot.launch()
     .then(() => console.log('Bot started'))

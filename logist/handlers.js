@@ -1,6 +1,7 @@
 const models = require('./models');
 const index = require('../index');
 const db = require('../database');
+const {status} = require(`../data`)
 
 module.exports = (bot) => {
     bot.hears(`📋 Неотработанные заявки (Созданные)`, async (ctx)=>{
@@ -33,8 +34,13 @@ module.exports = (bot) => {
 
     bot.hears(`🚚 Мои машины`, async (ctx)=>{
         if(ctx.res.status === 2) {
-            return ctx.replyWithHTML(`🚚 Мои машины`, {reply_markup: {inline_keyboard: [[{text: 'Добавить наемного водителя', callback_data: 'add_livery_driver'}]]}})
+            return ctx.replyWithHTML(`🚚 Мои машины`, {reply_markup: {inline_keyboard: [[{text: 'Поиск ТТН по заявке', callback_data: 'get_ttn_by_form'}],[{text: 'Добавить наемного водителя', callback_data: 'add_livery_driver'}]]}})
         }
+    })
+
+    bot.action(`get_ttn_by_form`, async (ctx)=>{
+        ctx.answerCbQuery();
+        ctx.scene.enter(`get_ttn_by_form`)
     })
 
     bot.hears(`🚛 Самовывоз`, async (ctx)=>{
@@ -65,6 +71,16 @@ module.exports = (bot) => {
         ctx.editMessageText(`<b>Заявка завершена!</b>`, {parse_mode: 'HTML'});
         const form = await db.getForm(parseInt(ctx.match[1]))
         ctx.telegram.sendMessage(form.logist_id,`Завод ${await db.getZavodName(ctx.res.zavod)} завершил самовывоз к заявке #${form.fid}.`)
+
+        const user = await db.getUser(ctx.from.id);
+        if(user.zavod > -1){
+            const zavod = await db.getZavod(user.zavod);
+            if(zavod && zavod.group !== -1 && zavod.group !== null){
+                ctx.telegram.sendMessage(zavod.group, `<b>${status[user.status]} ${user.real_name || `Неизвестное имя`} (TG: ${ctx.from.first_name} @${ctx.from.username})
+
+Действие:</b> подтвердил самовывоз #${form.fid} ${form.date}  ${form.betonAmount} м³ ${form.betonType} ${await db.getZavodName(form.logist_id)}`, {parse_mode:'HTML'})
+            }
+        }
     })
 
     bot.action(`main_pickups`, async (ctx)=>{

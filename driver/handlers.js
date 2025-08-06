@@ -23,7 +23,7 @@ module.exports = (bot) => {
     })
 
     bot.action(/driver_my_forms:(\d+)/, async (ctx)=>{
-        if(ctx.res.status !== 3) return;
+        if(ctx.res.status !== 3 ) return;
 
         let data = await models.getOrdersForDriverByStatus(ctx.from.id, ctx.match[1]);
         data.but.push([{text: 'Вернуться', callback_data: 'driverForms'}])

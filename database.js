@@ -1,11 +1,13 @@
 const mysql = require('mysql-await');
 require('dotenv').config();
+console.log(process.env.DB_HOST)
 const pool = mysql.createPool({
     connectionLimit: 5,
     host: process.env.DB_HOST,
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
-    database: process.env.DB_NAME
+    database: process.env.DB_NAME,
+    charset: 'utf8mb4'
 });
 
 pool.on('error', (err) => {
@@ -18,14 +20,14 @@ pool.on('error', (err) => {
 
 module.exports = {
     getAcceptedForms: async (zavod) => {
-        const forms = await pool.awaitQuery(`SELECT * FROM forms WHERE status=1 AND (type=1 OR type=2) AND zavod=?`, [zavod])
+        const forms = await pool.awaitQuery(`SELECT * FROM forms WHERE status=1 AND type=1 AND zavod=?`, [zavod])
         return forms;
     },
     getFormsToCarrier: async (zavod) => {
         const forms = await pool.awaitQuery(`SELECT f.* 
 FROM forms f
 WHERE (f.status=1 OR f.status=2) 
-  AND (f.type=1 OR f.type=2) 
+  AND f.type=1
   AND f.to_carrier=?
   AND (
       NOT EXISTS (SELECT 1 FROM form_cars fc WHERE fc.form_id = f.fid)
@@ -198,7 +200,7 @@ WHERE (f.status=1 OR f.status=2)
 FROM forms f
 INNER JOIN form_cars fc ON f.fid = fc.form_id
 WHERE (f.status=1 OR f.status=2) 
-  AND (f.type=1 OR f.type=2) 
+  AND f.type=1
   AND f.to_carrier=?
   AND fc.carrier = 1
   AND SUBSTRING(f.date, 1, 10) = DATE_FORMAT(CURDATE(), '%d.%m.%Y')`, [zavod])
@@ -209,7 +211,7 @@ WHERE (f.status=1 OR f.status=2)
 FROM forms f
 INNER JOIN form_cars fc ON f.fid = fc.form_id
 WHERE (f.status=1 OR f.status=2) 
-  AND (f.type=1 OR f.type=2) 
+  AND f.type=1
   AND f.fid = ?
   AND fc.carrier = 1`, [fid])
         return form.length > 0;
@@ -219,7 +221,7 @@ WHERE (f.status=1 OR f.status=2)
 FROM forms f
 INNER JOIN form_cars fc ON f.fid = fc.form_id
 WHERE (f.status=1 OR f.status=2) 
-  AND (f.type=1 OR f.type=2) 
+  AND f.type=1
   AND f.to_carrier=?
   AND fc.carrier = 1
   AND SUBSTRING(f.date, 1, 10) = DATE_FORMAT(DATE_ADD(CURDATE(), INTERVAL 1 DAY), '%d.%m.%Y')`, [zavod])
@@ -227,7 +229,7 @@ WHERE (f.status=1 OR f.status=2)
     },
     getZavodName: async (zavod) => {
         const z = await pool.awaitQuery(`SELECT * FROM zavod WHERE fid=?`, [zavod])
-        return z[0].name;
+        return z[0]?.name || 'Завод не найден';
     },
     getCondition: async (id) => {
         const condition = await pool.awaitQuery(`SELECT * FROM \`condition\` WHERE fid=?`, [id])
@@ -236,8 +238,11 @@ WHERE (f.status=1 OR f.status=2)
     updateForm: async (fid, edit, value) => {
         return await pool.awaitQuery(`UPDATE forms SET ${edit}=? WHERE fid=?`, [value, fid])
     },
+    updateZavod: async (fid, key, value) => {
+        return await pool.awaitQuery(`UPDATE zavod SET \`${key}\`=? WHERE fid=?`, [value, fid])
+    },
     getFormsToAllCarriers: async () => {
-        const forms = await pool.awaitQuery(`SELECT * FROM forms WHERE (status=2 OR status=1) AND (type=1 OR type=2) AND to_carrier=-1`)
+        const forms = await pool.awaitQuery(`SELECT * FROM forms WHERE (status=2 OR status=1) AND type=1 AND to_carrier=-1`)
         return forms;
     },
     findCarByDriver: async (driver) => {
@@ -284,8 +289,8 @@ JOIN cars ON form_cars.car_id = cars.fid
 WHERE cars.driver = ? AND forms.status = 2`, [driver])
         return forms;
     },
-    getManagersAndLogists: async (zavod) => {
-        const all = await pool.awaitQuery(`SELECT * FROM users WHERE (status=2 OR status=1) AND zavod=?`, [zavod])
+    getManagersAndLogistsByZavodAndForm: async (zavod, formId) => {
+        const all = await pool.awaitQuery(`SELECT * FROM users WHERE (status=2 OR status=1) AND (zavod=? OR zavod=(SELECT zavod FROM forms WHERE fid=?))`, [zavod, formId])
         return all;
     },
     getCarByDriver: async (driver) => {
@@ -337,7 +342,7 @@ WHERE cars.driver = ? AND forms.status = 2`, [driver])
         return (await pool.awaitQuery(`SELECT * FROM zavod WHERE fid=(SELECT zavod FROM users WHERE id=?)`, [userId]))[0].name
     },
     getFormsToShipment: async (zavod)=>{
-        return await pool.awaitQuery(`SELECT * FROM forms WHERE (status=1 OR status=2) AND (type=1 OR type=2) AND zavod=?`, [zavod])
+        return await pool.awaitQuery(`SELECT * FROM forms WHERE (status=1 OR status=2) AND type=1 AND zavod=?`, [zavod])
     },
     getUPDFormsYesterday: async (zavod)=>{
         return await pool.awaitQuery(`SELECT f.* 
@@ -375,10 +380,38 @@ WHERE f.zavod = ?
         const zavod = await pool.awaitQuery(`SELECT * FROM zavod WHERE fid=${zavodId}`);
         return zavod[0];
     },
+    deleteZavod: async (zavodId) => {
+        return await pool.awaitQuery(`DELETE FROM zavod WHERE fid=?`, [zavodId])
+    },
+    deleteAccountsOfZavod: async (zavodId) => {
+        return await pool.awaitQuery(`DELETE FROM users WHERE zavod=?`, [zavodId])
+    },
     getAllIncomingPickups: async (zavod) => {
         return await pool.awaitQuery(`SELECT * FROM forms WHERE (pickup=-1 OR pickup=?) AND isPickup=0`, [zavod]);
     },
     getAllConfirmedPickups: async (zavod) => {
         return await pool.awaitQuery(`SELECT * FROM forms WHERE pickup=? AND isPickup=1`, [zavod]);
+    },
+    getZavodOffersForUser: async (userId) => {
+        return await pool.awaitQuery(`SELECT f1.* 
+FROM forms f1
+JOIN forms f2 ON f1.last_fid = f2.fid
+WHERE f2.created_by = ?
+AND f1.type = 2;`, [userId]);
+    },
+    acceptOfferForClient: async (formId) => {
+        const form = await pool.awaitQuery(`SELECT * FROM forms WHERE fid=?`, [formId]);
+        await pool.awaitQuery(`UPDATE forms SET status=1, type=1 WHERE fid=?`, [formId]);
+        await pool.awaitQuery(`DELETE FROM forms WHERE last_fid=? AND fid!=?`, [form.last_fid, formId])
+        await pool.awaitQuery(`DELETE FROM forms WHERE fid=?`, [form.last_fid])
+    },
+    getBetonName: async (betonId) => {
+        return (await pool.awaitQuery(`SELECT * FROM nc WHERE fid=?`,[betonId]))[0]?.name || 'МАРКА НЕ НАЙДЕНА'
+    },
+    getDriverFormsByFormId: async (formId) => { 
+        return (await pool.awaitQuery(`SELECT ttn FROM driver_forms WHERE form_id=?`, [formId]))
+    },
+    getFormsByZavod: async (zavod) => {
+        return await pool.awaitQuery(`SELECT * FROM forms WHERE zavod=? AND type=1 AND (status=1 OR status=2) AND postoyanik=1`, [zavod])
     }
 }
